@@ -1,161 +1,278 @@
 import os
-import requests
-import datetime
+import sys
+from dataclasses import dataclass
+from datetime import datetime
 from urllib.parse import quote_plus
 
+import requests
 
-# =========================
-# CONFIG
-# =========================
+# ====== Jira / Slack Config ======
+JIRA_DOMAIN = "zillowgroup.atlassian.net"
+JIRA_API_BASE = f"https://{JIRA_DOMAIN}/rest/api/3"
 
-JIRA_BASE_URL = os.environ["JIRA_BASE_URL"].rstrip("/")
-JIRA_EMAIL = os.environ["JIRA_EMAIL"]
-JIRA_API_TOKEN = os.environ["JIRA_API_TOKEN"]
-SLACK_WEBHOOK = os.environ["SLACK_WEBHOOK"]
+# This is the ALL-TIME filter you provided (points to your saved Jira filter view)
+ALL_TIME_FILTER_URL = "https://zillowgroup.atlassian.net/issues?filter=77859"
 
-# Permanent Jira Filter View (ALL Team Lead Jiras)
-ALL_ESCALATIONS_FILTER_URL = "https://zillowgroup.atlassian.net/issues?filter=77859"
-
-# Reporter account IDs
-REPORTERS = [
-    "712020:e42cac78-cbc0-4090-985a-549ad893ef45",
-    "712020:894cfdc5-4bcb-4380-acf2-e280c363d6dd",
-    "712020:a520d240-bce6-4293-8101-f8d36195930b",
-    "712020:453a4414-1382-4054-b762-a6191d545e65",
-    "712020:f78b4a9f-5620-414c-ba21-b2aebf49ce33",
-    "712020:663a58b0-f773-4b95-b2e2-77b78495cdcf",
+# Team Leads (Adam + Marissa intentionally excluded)
+TEAM_LEAD_DISPLAY_NAMES = [
+    "Kay Thomas",
+    "Maryuri Orellana",
+    "Emmanuel Whyte",
+    "Evan Sandora",
+    "Kyler VanderValk",
+    "Zane Roberts",
 ]
 
+BASE_JQL = ""  # Optional additional filters (leave blank unless you want extra constraints)
 
-# =========================
-# DATE WINDOW (Last Mon–Fri)
-# =========================
-
-def get_last_week_window():
-    today = datetime.date.today()
-    this_monday = today - datetime.timedelta(days=today.weekday())
-    last_monday = this_monday - datetime.timedelta(days=7)
-    last_friday = last_monday + datetime.timedelta(days=4)
-
-    start = f"{last_monday} 00:00"
-    end = f"{last_friday} 23:59"
-
-    return start, end
+# Message behavior
+MAX_ITEMS_IN_SLACK = 6  # show only 6 issues, rest forced to Jira
+TIMEZONE_LABEL = "CT"   # label only (we use timezone-agnostic JQL functions for accuracy)
 
 
-# =========================
-# JQL BUILDER
-# =========================
+# ====== Data model ======
+@dataclass
+class Config:
+    jira_email: str
+    jira_api_token: str
+    slack_webhook: str
+    event_name: str
+    force_run: bool
 
-def build_jql():
-    start, end = get_last_week_window()
-    reporter_clause = ", ".join(f'"{r}"' for r in REPORTERS)
 
-    jql = (
-        f"reporter in ({reporter_clause}) "
-        f'AND created >= "{start}" '
-        f'AND created <= "{end}" '
-        "ORDER BY created DESC"
+# ====== Helpers ======
+def require_env(name: str) -> str:
+    v = os.getenv(name, "").strip()
+    if not v:
+        raise RuntimeError(f"Missing required env var: {name}")
+    return v
+
+
+def parse_bool(v: str) -> bool:
+    return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def get_config() -> Config:
+    jira_email = require_env("JIRA_EMAIL")
+    jira_api_token = require_env("JIRA_API_TOKEN")
+    slack_webhook = require_env("SLACK_WEBHOOK")
+
+    event_name = os.getenv("GITHUB_EVENT_NAME", "").strip()
+    force_run_env = os.getenv("FORCE_RUN", "").strip()
+
+    # If workflow_dispatch or FORCE_RUN=true, run regardless of schedule
+    force_run = parse_bool(force_run_env) or (event_name == "workflow_dispatch")
+
+    return Config(
+        jira_email=jira_email,
+        jira_api_token=jira_api_token,
+        slack_webhook=slack_webhook,
+        event_name=event_name,
+        force_run=force_run,
     )
-    return jql
 
 
-# =========================
-# JIRA API CALL
-# =========================
-
-def get_issues(jql):
-    url = f"{JIRA_BASE_URL}/rest/api/3/search/jql"
-
-    headers = {
-        "Accept": "application/json"
-    }
-
-    response = requests.get(
+def jira_get(config: Config, path: str, params: dict | None = None):
+    url = f"{JIRA_API_BASE}{path}"
+    resp = requests.get(
         url,
-        headers=headers,
-        params={"jql": jql, "maxResults": 100},
-        auth=(JIRA_EMAIL, JIRA_API_TOKEN)
+        params=params or {},
+        auth=(config.jira_email, config.jira_api_token),
+        headers={"Accept": "application/json"},
+        timeout=30,
     )
-
-    if response.status_code != 200:
-        raise RuntimeError(f"Jira API error {response.status_code}: {response.text}")
-
-    return response.json().get("issues", [])
+    if resp.status_code >= 400:
+        raise RuntimeError(f"Jira API GET {path} error {resp.status_code}: {resp.text}")
+    return resp.json()
 
 
-# =========================
-# SLACK POST
-# =========================
+def resolve_account_ids(config: Config, display_names: list[str]) -> dict[str, str]:
+    """
+    Resolve Jira Cloud accountIds for each display name.
+    We prefer exact displayName match + active user.
+    """
+    resolved: dict[str, str] = {}
 
-def post_to_slack(message):
-    response = requests.post(
-        SLACK_WEBHOOK,
-        json={"text": message}
-    )
+    for name in display_names:
+        results = jira_get(config, "/user/search", params={"query": name, "maxResults": 50})
 
-    if response.status_code != 200:
-        raise RuntimeError(f"Slack webhook error {response.status_code}: {response.text}")
+        if not isinstance(results, list) or not results:
+            raise RuntimeError(f'Could not resolve Jira accountId for "{name}"')
+
+        # Prefer exact match + active
+        exact = [
+            u for u in results
+            if (u.get("displayName", "") or "").strip().lower() == name.strip().lower()
+            and u.get("active", True)
+        ]
+        if exact:
+            resolved[name] = exact[0]["accountId"]
+            continue
+
+        # Fallback: first active result, else first result
+        active = [u for u in results if u.get("active", True)]
+        pick = active[0] if active else results[0]
+        resolved[name] = pick["accountId"]
+
+    return resolved
 
 
-# =========================
-# MAIN
-# =========================
+def build_jql(account_ids: list[str]) -> str:
+    """
+    Timezone-agnostic "last week" window using Jira JQL functions:
+      - startOfWeek(-1) = last Monday 00:00 (in Jira/server/user context)
+      - startOfWeek()   = this Monday 00:00
+    This avoids timezone drift / seconds formatting issues.
+    """
+    if not account_ids:
+        raise RuntimeError("No Jira accountIds available.")
 
-def main():
-    jql = build_jql()
-    issues = get_issues(jql)
+    parts = []
+    if BASE_JQL.strip():
+        parts.append(f"({BASE_JQL.strip()})")
+
+    reporters = ", ".join([f'"{aid}"' for aid in account_ids])
+    parts.append(f"reporter in ({reporters})")
+
+    # Cover last week Monday -> this week Monday
+    parts.append("created >= startOfWeek(-1)")
+    parts.append("created < startOfWeek()")
+
+    where_clause = " AND ".join(parts)
+    return where_clause + " ORDER BY created DESC"
+
+
+def get_issues(config: Config, jql: str) -> list[dict]:
+    """
+    Jira Cloud search endpoint (new): POST /rest/api/3/search/jql
+    """
+    url = f"{JIRA_API_BASE}/search/jql"
+
+    issues: list[dict] = []
+    next_token = None
+
+    while True:
+        body = {
+            "jql": jql,
+            "maxResults": 100,
+            "fields": [
+                "summary",
+                "priority",
+                "status",
+                "created",
+                "reporter",
+            ],
+        }
+        if next_token:
+            body["nextPageToken"] = next_token
+
+        resp = requests.post(
+            url,
+            auth=(config.jira_email, config.jira_api_token),
+            headers={"Accept": "application/json", "Content-Type": "application/json"},
+            json=body,
+            timeout=30,
+        )
+
+        if resp.status_code >= 400:
+            raise RuntimeError(f"Jira API error {resp.status_code}: {resp.text}")
+
+        data = resp.json()
+        issues.extend(data.get("issues", []))
+
+        next_token = data.get("nextPageToken")
+        is_last = data.get("isLast", True)
+
+        if is_last or not next_token:
+            break
+
+    return issues
+
+
+def format_issue_line(issue: dict) -> str:
+    """
+    Slack formatting:
+    • KEY — Summary (**Reporter, Status, Priority**)
+    """
+    key = issue.get("key", "UNKNOWN")
+    fields = issue.get("fields", {}) or {}
+    summary = (fields.get("summary") or "").strip()
+
+    status = (fields.get("status") or {}).get("name", "")
+    priority = (fields.get("priority") or {}).get("name", "")
+    reporter = (fields.get("reporter") or {}).get("displayName", "")
+
+    issue_url = f"https://{JIRA_DOMAIN}/browse/{key}"
+
+    meta_parts = [p for p in [reporter, status, priority] if p]
+    meta = f" (**{', '.join(meta_parts)}**)" if meta_parts else ""
+
+    return f"• <{issue_url}|{key}> — {summary}{meta}"
+
+
+def post_to_slack(webhook: str, text: str):
+    resp = requests.post(webhook, json={"text": text}, timeout=30)
+    if resp.status_code >= 400:
+        raise RuntimeError(f"Slack webhook error {resp.status_code}: {resp.text}")
+
+
+# ====== Main ======
+def main() -> int:
+    config = get_config()
+
+    # Scheduled behavior:
+    # - In production, you'll schedule this via GitHub Actions cron (Mon 8:30am CT).
+    # - If it runs outside schedule and isn't forced, we skip without failing.
+    #
+    # NOTE: GitHub cron uses UTC. Do the conversion in the workflow file.
+    if not config.force_run:
+        # If you still want a "soft guard", keep it loose:
+        # Only allow runs on Monday (any hour) unless forced.
+        now = datetime.utcnow()
+        # Monday in UTC may not match CT perfectly; so keep this guard minimal.
+        # If you prefer, delete this guard entirely and rely purely on cron schedule.
+        # We'll just not block anything here to avoid surprises.
+        pass
+
+    name_to_id = resolve_account_ids(config, TEAM_LEAD_DISPLAY_NAMES)
+    account_ids = list(name_to_id.values())
+
+    jql = build_jql(account_ids)
+    issues = get_issues(config, jql)
 
     header = (
-        "⚠️ Escalations Created Last Week\n\n"
-        "📌 Take a minute to review known issues to be aware of this week. "
+        ":warning: *Escalations Created Last Week*\n\n"
+        ":pushpin: Take a minute to review known issues to be aware of this week. "
         "If your issue resembles one below, send the ticket to Tag Team and reference the Jira link. "
         "Please do not add examples to Jira on your own. This is for information purposes only.\n\n"
         f"Total: {len(issues)}\n\n"
     )
 
     if not issues:
-        post_to_slack(header + "• No issues found.")
-        return
+        footer = f"\n… and 0 more. <{ALL_TIME_FILTER_URL}|View all escalations in Jira>"
+        post_to_slack(config.slack_webhook, header + "• No issues found.\n" + footer)
+        return 0
 
-    max_display = 6
-    displayed_issues = issues[:max_display]
+    # Show first N items
+    shown = issues[:MAX_ITEMS_IN_SLACK]
+    lines = [format_issue_line(i) for i in shown]
+    msg = header + "\n".join(lines)
 
-    body_lines = []
+    remaining = max(0, len(issues) - len(shown))
+    footer = f"\n\n… and {remaining} more. <{ALL_TIME_FILTER_URL}|View all escalations in Jira>"
+    msg += footer
 
-    for issue in displayed_issues:
-        key = issue["key"]
-        summary = issue["fields"]["summary"]
-        reporter = issue["fields"]["reporter"]["displayName"]
-        status = issue["fields"]["status"]["name"]
-        priority = issue["fields"]["priority"]["name"] if issue["fields"]["priority"] else "Not Set"
+    # Slack size guard
+    if len(msg) > 35000:
+        msg = msg[:34000] + "\n\n… (truncated)\n" + f"<{ALL_TIME_FILTER_URL}|View all escalations in Jira>"
 
-        jira_link = f"{JIRA_BASE_URL}/browse/{key}"
-
-        body_lines.append(
-            f"• <{jira_link}|{key}> — {summary} "
-            f"*({reporter}, {status}, {priority})*"
-        )
-
-    body = "\n".join(body_lines)
-
-    remaining = len(issues) - max_display
-
-    footer = ""
-    if remaining > 0:
-        footer = (
-            f"\n\n… and {remaining} more. "
-            f"<{ALL_ESCALATIONS_FILTER_URL}|View all escalations in Jira>"
-        )
-    else:
-        footer = (
-            f"\n\n<{ALL_ESCALATIONS_FILTER_URL}|View all escalations in Jira>"
-        )
-
-    full_message = header + body + footer
-
-    post_to_slack(full_message)
+    post_to_slack(config.slack_webhook, msg)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        raise SystemExit(main())
+    except Exception as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        raise
