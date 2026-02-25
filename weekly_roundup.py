@@ -18,6 +18,7 @@ TEAM_LEAD_DISPLAY_NAMES = [
 ]
 
 BASE_JQL = ""
+DISPLAY_LIMIT = 6
 
 
 @dataclass
@@ -153,8 +154,6 @@ def format_issue_line(issue: dict) -> str:
     issue_url = f"https://{JIRA_DOMAIN}/browse/{key}"
 
     meta = [x for x in [reporter, status, priority] if x]
-
-    # Entire parenthesis block bolded
     meta_str = f" *({', '.join(meta)})*" if meta else ""
 
     return f"• <{issue_url}|{key}> — {summary}{meta_str}"
@@ -176,18 +175,13 @@ def main() -> int:
     account_ids = resolve_account_ids(config, TEAM_LEAD_DISPLAY_NAMES)
     jql = build_jql(account_ids)
 
-    print(f"Reporters tracked: {len(account_ids)}")
-    print(f"JQL: {jql}")
-    print(f"Verify: {jira_search_link(jql)}")
-
     issues = get_issues(config, jql)
 
     header = (
         "⚠️ *Escalations Created Last Week*\n\n"
         "📌 Take a minute to review known issues to be aware of this week.\n"
         "If your issue resembles one below, reference it in your Tag Team escalation.\n\n"
-        f"Total: {len(issues)}\n"
-        f"<{jira_search_link(jql)}|Open this JQL in Jira>\n\n"
+        f"Total: {len(issues)}\n\n"
     )
 
     if not issues:
@@ -195,10 +189,19 @@ def main() -> int:
         return 0
 
     lines = [format_issue_line(i) for i in issues]
-    msg = header + "\n".join(lines)
 
-    if len(msg) > 35000:
-        msg = header + "\n".join(lines[:150]) + "\n• (truncated)"
+    if len(issues) > DISPLAY_LIMIT:
+        visible = lines[:DISPLAY_LIMIT]
+        remaining = len(issues) - DISPLAY_LIMIT
+
+        footer = (
+            f"\n\n… and {remaining} more. "
+            f"<{jira_search_link(jql)}|View all escalations in Jira>"
+        )
+
+        msg = header + "\n".join(visible) + footer
+    else:
+        msg = header + "\n".join(lines)
 
     post_to_slack(config.slack_webhook, msg)
     return 0
