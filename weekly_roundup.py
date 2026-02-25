@@ -1,133 +1,206 @@
 import os
-import requests
-from datetime import datetime, timedelta, timezone
+import sys
+from dataclasses import dataclass
+from datetime import datetime, timedelta, time
 from zoneinfo import ZoneInfo
 
-# Jira domain
+import requests
+
 JIRA_DOMAIN = "zillowgroup.atlassian.net"
-JIRA_URL = f"https://{JIRA_DOMAIN}/rest/api/3/search"
+JIRA_API_BASE = f"https://{JIRA_DOMAIN}/rest/api/3"
 
-# Secrets (set in GitHub → Settings → Secrets → Actions)
-JIRA_EMAIL = os.getenv("JIRA_EMAIL")
-JIRA_API_TOKEN = os.getenv("JIRA_API_TOKEN")
-SLACK_WEBHOOK = os.getenv("SLACK_WEBHOOK")
+# ✅ TEST MODE: Kay Thomas only
+KAY_THOMAS_ACCOUNT_ID = "712020:e42cac78-cbc0-4090-985a-549ad893ef45"
 
-# If FORCE_RUN=1 (set by workflow_dispatch), we bypass time checks for testing.
-FORCE_RUN = os.getenv("FORCE_RUN") == "1"
+BASE_JQL = ""  # optional, leave blank for now
 
-# Team Leads (reporters)
-REPORTERS = [
-    "Emmanuel Whyte",
-    "Kay Thomas",
-    "Evan Sandora",
-    "Kyler VanderValk",
-    "Maryuri Orellana",
-    "Melissa Kayle",
-    "Adam MeClure",
-    "Zane Roberts",
-]
+CENTRAL_TZ = ZoneInfo("America/Chicago")
 
-def require_env(name: str):
-    if not os.getenv(name):
+
+@dataclass
+class Config:
+    jira_email: str
+    jira_api_token: str
+    slack_webhook: str
+    event_name: str
+    force_run: bool
+
+
+def require_env(name: str) -> str:
+    v = os.getenv(name, "").strip()
+    if not v:
         raise RuntimeError(f"Missing required env var: {name}")
+    return v
 
-def should_post_now(now_utc: datetime) -> bool:
-    """
-    Scheduled behavior: Only post if it's Friday 12pm in America/Chicago.
-    """
-    central = ZoneInfo("America/Chicago")
-    now_c = now_utc.astimezone(central)
-    return (now_c.weekday() == 4) and (now_c.hour == 12)
 
-def compute_window(now_utc: datetime):
-    """
-    Window anchored to Friday noon Central:
-      Start = last Friday 12:00 PM America/Chicago
-      End   = this Friday 12:00 PM America/Chicago (end-exclusive)
-    """
-    central = ZoneInfo("America/Chicago")
-    now_central = now_utc.astimezone(central)
+def parse_bool(v: str) -> bool:
+    return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
 
-    # Find most recent Friday (Mon=0 .. Sun=6, Fri=4)
-    days_since_friday = (now_central.weekday() - 4) % 7
-    this_friday_noon = (now_central - timedelta(days=days_since_friday)).replace(
-        hour=12, minute=0, second=0, microsecond=0
+
+def get_config() -> Config:
+    jira_email = require_env("JIRA_EMAIL")
+    jira_api_token = require_env("JIRA_API_TOKEN")
+    slack_webhook = require_env("SLACK_WEBHOOK")
+
+    event_name = os.getenv("GITHUB_EVENT_NAME", "").strip()
+    force_run_env = os.getenv("FORCE_RUN", "").strip()
+
+    # ✅ If you click "Run workflow" (workflow_dispatch), it will run no matter what time it is.
+    force_run = parse_bool(force_run_env) or (event_name == "workflow_dispatch")
+
+    return Config(
+        jira_email=jira_email,
+        jira_api_token=jira_api_token,
+        slack_webhook=slack_webhook,
+        event_name=event_name,
+        force_run=force_run,
     )
 
-    window_end_central = this_friday_noon
-    window_start_central = window_end_central - timedelta(days=7)
 
-    return window_start_central, window_end_central
+def central_now() -> datetime:
+    return datetime.now(tz=CENTRAL_TZ)
 
-def to_utc(dt_local: datetime) -> datetime:
-    return dt_local.astimezone(timezone.utc)
 
-def jira_dt(dt_utc: datetime) -> str:
-    # Format for JQL date-time literal
-    return dt_utc.strftime("%Y-%m-%d %H:%M")
+def last_friday_noon_central(now_ct: datetime) -> datetime:
+    """
+    Most recent Friday 12:00 PM CT at or before now_ct.
+    """
+    # Python: Monday=0 ... Sunday=6; Friday=4
+    days_since_friday = (now_ct.weekday() - 4) % 7
+    candidate_date = (now_ct - timedelta(days=days_since_friday)).date()
+    candidate_dt = datetime.combine(candidate_date, time(12, 0), tzinfo=CENTRAL_TZ)
 
-def build_jql(start_utc: datetime, end_utc: datetime) -> str:
-    reporters = ", ".join(f"\"{r}\"" for r in REPORTERS)
-    return f"""
-reporter IN ({reporters})
-AND created >= "{jira_dt(start_utc)}"
-AND created < "{jira_dt(end_utc)}"
-ORDER BY created DESC
-""".strip()
+    # If it's Friday but before noon, go back one week
+    if now_ct.weekday() == 4 and now_ct < candidate_dt:
+        candidate_dt -= timedelta(days=7)
 
-def get_issues(jql: str):
-    resp = requests.get(
-        JIRA_URL,
-        headers={"Accept": "application/json"},
-        params={"jql": jql, "maxResults": 100, "fields": "summary"},
-        auth=(JIRA_EMAIL, JIRA_API_TOKEN),
-        timeout=30,
-    )
-    resp.raise_for_status()
-    return resp.json().get("issues", [])
+    return candidate_dt
 
-def format_message(issues, start_central: datetime, end_central: datetime) -> str:
-    header = (
-        "📊 *Weekly TL Jira Roundup*\n"
-        f"*Window:* {start_central.strftime('%b %d, %I:%M %p %Z')} → "
-        f"{end_central.strftime('%b %d, %I:%M %p %Z')} (end-exclusive)"
-    )
 
+def build_jql(start_ct: datetime, end_ct: datetime) -> str:
+    """
+    Jira JQL expects user references by accountId in Jira Cloud.
+    Times are passed in Central time with offset.
+    """
+    start_str = start_ct.strftime("%Y-%m-%d %H:%M")
+    end_str = end_ct.strftime("%Y-%m-%d %H:%M")
+    tz_offset = end_ct.strftime("%z")  # e.g. -0600 / -0500
+
+    parts = []
+    if BASE_JQL.strip():
+        parts.append(f"({BASE_JQL.strip()})")
+
+    parts.append(f"reporter = {KAY_THOMAS_ACCOUNT_ID}")
+    parts.append(f'created >= "{start_str} {tz_offset}"')
+    parts.append(f'created < "{end_str} {tz_offset}"')
+
+    return " AND ".join(parts)
+
+
+def jira_auth_header(email: str, token: str) -> dict:
+    basic = f"{email}:{token}".encode("utf-8")
+    return {"Authorization": "Basic " + requests.utils.to_native_string(__import__("base64").b64encode(basic))}
+
+
+def get_issues(config: Config, jql: str) -> list[dict]:
+    url = f"{JIRA_API_BASE}/search"
+    headers = {
+        **jira_auth_header(config.jira_email, config.jira_api_token),
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
+
+    issues: list[dict] = []
+    start_at = 0
+    max_results = 50
+
+    while True:
+        params = {
+            "jql": jql,
+            "startAt": start_at,
+            "maxResults": max_results,
+            "fields": "summary,issuetype,project,priority,status,created,reporter",
+        }
+        resp = requests.get(url, headers=headers, params=params, timeout=30)
+
+        if resp.status_code >= 400:
+            raise RuntimeError(f"Jira API error {resp.status_code}: {resp.text}")
+
+        data = resp.json()
+        batch = data.get("issues", [])
+        issues.extend(batch)
+
+        total = data.get("total", 0)
+        start_at += len(batch)
+        if start_at >= total or not batch:
+            break
+
+    return issues
+
+
+def format_issue_line(issue: dict) -> str:
+    key = issue.get("key", "UNKNOWN")
+    fields = issue.get("fields", {})
+    summary = (fields.get("summary") or "").strip()
+    status = (fields.get("status") or {}).get("name", "")
+    priority = (fields.get("priority") or {}).get("name", "")
+    issue_url = f"https://{JIRA_DOMAIN}/browse/{key}"
+
+    bits = [f"<{issue_url}|{key}>", summary]
+    meta = [x for x in [status, priority] if x]
+    if meta:
+        bits.append(f"({', '.join(meta)})")
+
+    return "• " + " — ".join(bits)
+
+
+def post_to_slack(webhook: str, text: str) -> None:
+    payload = {"text": text}
+    resp = requests.post(webhook, json=payload, timeout=30)
+    if resp.status_code >= 400:
+        raise RuntimeError(f"Slack webhook error {resp.status_code}: {resp.text}")
+
+
+def main() -> int:
+    config = get_config()
+    now_ct = central_now()
+
+    # ✅ Scheduled behavior: only post at Friday 12pm CT (your workflow already triggers at that time),
+    # but if something triggers outside that time, we don't want a hard fail—just skip.
+    if not config.force_run:
+        if not (now_ct.weekday() == 4 and now_ct.hour == 12):
+            print("Not within Friday 12pm CT hour; skipping.")
+            return 0
+
+    start_ct = last_friday_noon_central(now_ct)
+    end_ct = now_ct
+
+    jql = build_jql(start_ct, end_ct)
+    print(f"Window: {start_ct.isoformat()} → {end_ct.isoformat()}")
+    print(f"JQL: {jql}")
+
+    issues = get_issues(config, jql)
+
+    header = f"*Weekly Jira Roundup (Kay Thomas)*\nWindow: {start_ct.strftime('%a %b %d, %Y %I:%M %p CT')} → {end_ct.strftime('%a %b %d, %Y %I:%M %p CT')}\nTotal: {len(issues)}"
     if not issues:
-        return f"{header}\n\nNo tickets created in this window."
+        post_to_slack(config.slack_webhook, header + "\n• No issues found.")
+        return 0
 
-    lines = []
-    for issue in issues:
-        key = issue["key"]
-        summary = issue["fields"]["summary"]
-        link = f"https://{JIRA_DOMAIN}/browse/{key}"
-        lines.append(f"• <{link}|{key}> – {summary}")
+    lines = [format_issue_line(i) for i in issues]
+    body = "\n".join(lines)
 
-    return f"{header}\n\n*Total Created:* {len(issues)}\n\n" + "\n".join(lines)
+    # Slack message size guard (simple)
+    msg = header + "\n" + body
+    if len(msg) > 35000:
+        msg = header + "\n" + "\n".join(lines[:150]) + "\n• (truncated)"
 
-def post_to_slack(text: str):
-    resp = requests.post(SLACK_WEBHOOK, json={"text": text}, timeout=30)
-    resp.raise_for_status()
+    post_to_slack(config.slack_webhook, msg)
+    return 0
+
 
 if __name__ == "__main__":
-    # Validate secrets are present
-    require_env("JIRA_EMAIL")
-    require_env("JIRA_API_TOKEN")
-    require_env("SLACK_WEBHOOK")
-
-    now_utc = datetime.now(timezone.utc)
-
-    # If not a manual run, enforce Friday 12pm CT
-    if (not FORCE_RUN) and (not should_post_now(now_utc)):
-        print("Not within Friday 12pm CT hour; skipping.")
-        raise SystemExit(0)
-
-    # Compute the anchored window and query Jira
-    start_c, end_c = compute_window(now_utc)
-    start_utc, end_utc = to_utc(start_c), to_utc(end_c)
-
-    jql = build_jql(start_utc, end_utc)
-    issues = get_issues(jql)
-
-    msg = format_message(issues, start_c, end_c)
-    post_to_slack(msg)
+    try:
+        raise SystemExit(main())
+    except Exception as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        raise
