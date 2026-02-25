@@ -120,26 +120,29 @@ def resolve_account_ids(config: Config, display_names: list[str]) -> dict[str, s
     return resolved
 
 
+# ✅ FIXED VERSION (Jira-compliant)
 def build_jql(start_ct: datetime, end_ct: datetime, account_ids: list[str]) -> str:
     if not account_ids:
         raise RuntimeError("No Jira accountIds available.")
 
-    # 🔥 FIX: include seconds and use <=
-    start_str = start_ct.strftime("%Y-%m-%d %H:%M:%S")
-    end_str = end_ct.strftime("%Y-%m-%d %H:%M:%S")
+    # Round end time UP to next minute to prevent edge exclusion
+    end_ct_rounded = end_ct.replace(second=0, microsecond=0) + timedelta(minutes=1)
+
+    start_str = start_ct.strftime("%Y-%m-%d %H:%M")
+    end_str = end_ct_rounded.strftime("%Y-%m-%d %H:%M")
 
     parts = []
     if BASE_JQL.strip():
         parts.append(f"({BASE_JQL.strip()})")
 
-    reporters = ", ".join(account_ids)
+    # Quote accountIds (required due to colon in ID)
+    reporters = ", ".join([f'"{rid}"' for rid in account_ids])
+
     parts.append(f"reporter in ({reporters})")
     parts.append(f'created >= "{start_str}"')
-    parts.append(f'created <= "{end_str}"')  # changed from < to <=
+    parts.append(f'created < "{end_str}"')
 
-    where_clause = " AND ".join(parts)
-
-    return where_clause + " ORDER BY created DESC"
+    return " AND ".join(parts) + " ORDER BY created DESC"
 
 
 def get_issues(config: Config, jql: str) -> list[dict]:
