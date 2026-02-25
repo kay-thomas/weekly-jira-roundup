@@ -17,7 +17,6 @@ TEAM_LEAD_DISPLAY_NAMES = [
     "Zane Roberts",
 ]
 
-ROLLING_DAYS = 7
 BASE_JQL = ""
 
 
@@ -78,6 +77,7 @@ def resolve_account_ids(config: Config, display_names: list[str]) -> list[str]:
     return account_ids
 
 
+# ✅ WEEKLY MONDAY → SUNDAY WINDOW (Timezone-agnostic)
 def build_jql(account_ids: list[str]) -> str:
     reporters = ", ".join([f'"{rid}"' for rid in account_ids])
 
@@ -86,7 +86,8 @@ def build_jql(account_ids: list[str]) -> str:
         parts.append(f"({BASE_JQL.strip()})")
 
     parts.append(f"reporter in ({reporters})")
-    parts.append(f"created >= -{ROLLING_DAYS}d")
+    parts.append("created >= startOfWeek(-1w)")
+    parts.append("created < startOfWeek()")
 
     return " AND ".join(parts) + " ORDER BY created DESC"
 
@@ -175,8 +176,8 @@ def main() -> int:
     issues = get_issues(config, jql)
 
     header = (
-        "*Weekly Jira Roundup (Team Leads)*\n"
-        f"Rolling window: last {ROLLING_DAYS} days\n"
+        "*Team Lead Jira Summary (Last Week)*\n"
+        "Covering Monday → Sunday\n"
         f"Reporters tracked: {len(account_ids)}\n"
         f"Total: {len(issues)}\n"
         f"<{jira_search_link(jql)}|Open this JQL in Jira>"
