@@ -1,0 +1,31 @@
+name: Weekly Jira Roundup
+
+on:
+  schedule:
+    # GitHub cron is UTC. Central time changes with DST.
+    # We run both 17:00 and 18:00 UTC on Fridays; the script only posts during 12pm CT.
+    - cron: "0 17 * * 5"
+    - cron: "0 18 * * 5"
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run weekly roundup
+        run: python weekly_roundup.py
+        env:
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
