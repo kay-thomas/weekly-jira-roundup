@@ -8,7 +8,6 @@ import requests
 JIRA_DOMAIN = "zillowgroup.atlassian.net"
 JIRA_API_BASE = f"https://{JIRA_DOMAIN}/rest/api/3"
 
-# Team Leads (Adam + Marissa intentionally excluded)
 TEAM_LEAD_DISPLAY_NAMES = [
     "Kay Thomas",
     "Maryuri Orellana",
@@ -18,9 +17,7 @@ TEAM_LEAD_DISPLAY_NAMES = [
     "Zane Roberts",
 ]
 
-# How many days back to include
 ROLLING_DAYS = 7
-
 BASE_JQL = ""
 
 
@@ -29,8 +26,6 @@ class Config:
     jira_email: str
     jira_api_token: str
     slack_webhook: str
-    event_name: str
-    force_run: bool
 
 
 def require_env(name: str) -> str:
@@ -40,26 +35,11 @@ def require_env(name: str) -> str:
     return v
 
 
-def parse_bool(v: str) -> bool:
-    return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
-
-
 def get_config() -> Config:
-    jira_email = require_env("JIRA_EMAIL")
-    jira_api_token = require_env("JIRA_API_TOKEN")
-    slack_webhook = require_env("SLACK_WEBHOOK")
-
-    event_name = os.getenv("GITHUB_EVENT_NAME", "").strip()
-    force_run_env = os.getenv("FORCE_RUN", "").strip()
-
-    force_run = parse_bool(force_run_env) or (event_name == "workflow_dispatch")
-
     return Config(
-        jira_email=jira_email,
-        jira_api_token=jira_api_token,
-        slack_webhook=slack_webhook,
-        event_name=event_name,
-        force_run=force_run,
+        jira_email=require_env("JIRA_EMAIL"),
+        jira_api_token=require_env("JIRA_API_TOKEN"),
+        slack_webhook=require_env("SLACK_WEBHOOK"),
     )
 
 
@@ -77,37 +57,28 @@ def jira_get(config: Config, path: str, params: dict | None = None):
     return resp.json()
 
 
-def resolve_account_ids(config: Config, display_names: list[str]) -> dict[str, str]:
-    resolved = {}
+def resolve_account_ids(config: Config, display_names: list[str]) -> list[str]:
+    account_ids = []
 
     for name in display_names:
         results = jira_get(config, "/user/search", params={"query": name, "maxResults": 50})
 
-        if not isinstance(results, list) or not results:
+        if not results:
             raise RuntimeError(f'Could not resolve Jira accountId for "{name}"')
 
         exact = [
             u for u in results
-            if (u.get("displayName", "") or "").strip().lower() == name.strip().lower()
+            if u.get("displayName", "").strip().lower() == name.lower()
             and u.get("active", True)
         ]
 
-        if exact:
-            resolved[name] = exact[0]["accountId"]
-            continue
+        pick = exact[0] if exact else results[0]
+        account_ids.append(pick["accountId"])
 
-        active = [u for u in results if u.get("active", True)]
-        pick = active[0] if active else results[0]
-
-        resolved[name] = pick["accountId"]
-
-    return resolved
+    return account_ids
 
 
 def build_jql(account_ids: list[str]) -> str:
-    if not account_ids:
-        raise RuntimeError("No Jira accountIds available.")
-
     reporters = ", ".join([f'"{rid}"' for rid in account_ids])
 
     parts = []
@@ -121,24 +92,32 @@ def build_jql(account_ids: list[str]) -> str:
 
 
 def get_issues(config: Config, jql: str) -> list[dict]:
-    url = f"{JIRA_API_BASE}/search"
+    url = f"{JIRA_API_BASE}/search/jql"
 
     issues = []
-    start_at = 0
+    next_token = None
 
     while True:
-        params = {
+        body = {
             "jql": jql,
-            "startAt": start_at,
             "maxResults": 100,
-            "fields": "summary,issuetype,project,priority,status,created,reporter",
+            "fields": [
+                "summary",
+                "priority",
+                "status",
+                "created",
+                "reporter",
+            ],
         }
 
-        resp = requests.get(
+        if next_token:
+            body["nextPageToken"] = next_token
+
+        resp = requests.post(
             url,
-            params=params,
             auth=(config.jira_email, config.jira_api_token),
-            headers={"Accept": "application/json"},
+            headers={"Accept": "application/json", "Content-Type": "application/json"},
+            json=body,
             timeout=30,
         )
 
@@ -149,10 +128,8 @@ def get_issues(config: Config, jql: str) -> list[dict]:
 
         issues.extend(data.get("issues", []))
 
-        total = data.get("total", 0)
-        start_at += data.get("maxResults", 0)
-
-        if start_at >= total:
+        next_token = data.get("nextPageToken")
+        if not next_token:
             break
 
     return issues
@@ -161,6 +138,7 @@ def get_issues(config: Config, jql: str) -> list[dict]:
 def format_issue_line(issue: dict) -> str:
     key = issue.get("key", "UNKNOWN")
     fields = issue.get("fields", {})
+
     summary = (fields.get("summary") or "").strip()
     status = (fields.get("status") or {}).get("name", "")
     priority = (fields.get("priority") or {}).get("name", "")
@@ -187,9 +165,7 @@ def post_to_slack(webhook: str, text: str):
 def main() -> int:
     config = get_config()
 
-    name_to_id = resolve_account_ids(config, TEAM_LEAD_DISPLAY_NAMES)
-    account_ids = list(name_to_id.values())
-
+    account_ids = resolve_account_ids(config, TEAM_LEAD_DISPLAY_NAMES)
     jql = build_jql(account_ids)
 
     print(f"Reporters tracked: {len(account_ids)}")
