@@ -177,14 +177,13 @@ def main() -> int:
 
     issues = get_issues(config, jql)
 
-  header = (
-    "⚠️ Escalations Created Last Week\n\n"
-    "📌 Take a minute to review known issues to be aware of this week. "
-    "If your issue resembles one below, send the ticket to Tag Team and reference the Jira link. "
-    "Please do not add examples to Jira on your own. This is for information purposes only.\n\n"
-    f"Total: {len(issues)}\n\n"
-)
-
+    header = (
+        "⚠️ Escalations Created Last Week\n\n"
+        "📌 Take a minute to review known issues to be aware of this week. "
+        "If your issue resembles one below, send the ticket to Tag Team and reference the Jira link. "
+        "Please do not add examples to Jira on your own. This is for information purposes only.\n\n"
+        f"Total: {len(issues)}\n\n"
+    )
     if not issues:
         post_to_slack(config.slack_webhook, header + "• No issues found.")
         return 0
