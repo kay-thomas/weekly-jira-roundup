@@ -60,7 +60,11 @@ def resolve_account_ids(config: Config, display_names: list[str]) -> list[str]:
     account_ids = []
 
     for name in display_names:
-        results = jira_get(config, "/user/search", params={"query": name, "maxResults": 50})
+        results = jira_get(
+            config,
+            "/user/search",
+            params={"query": name, "maxResults": 50},
+        )
 
         if not results:
             raise RuntimeError(f'Could not resolve Jira accountId for "{name}"')
@@ -116,7 +120,10 @@ def get_issues(config: Config, jql: str) -> list[dict]:
         resp = requests.post(
             url,
             auth=(config.jira_email, config.jira_api_token),
-            headers={"Accept": "application/json", "Content-Type": "application/json"},
+            headers={
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+            },
             json=body,
             timeout=30,
         )
@@ -146,7 +153,9 @@ def format_issue_line(issue: dict) -> str:
     issue_url = f"https://{JIRA_DOMAIN}/browse/{key}"
 
     meta = [x for x in [reporter, status, priority] if x]
-    meta_str = f" ({', '.join(meta)})" if meta else ""
+
+    # Entire parenthesis block bolded
+    meta_str = f" *({', '.join(meta)})*" if meta else ""
 
     return f"• <{issue_url}|{key}> — {summary}{meta_str}"
 
