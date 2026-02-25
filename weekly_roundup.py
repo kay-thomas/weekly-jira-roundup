@@ -12,6 +12,9 @@ JIRA_EMAIL = os.getenv("JIRA_EMAIL")
 JIRA_API_TOKEN = os.getenv("JIRA_API_TOKEN")
 SLACK_WEBHOOK = os.getenv("SLACK_WEBHOOK")
 
+# If FORCE_RUN=1 (set by workflow_dispatch), we bypass time checks for testing.
+FORCE_RUN = os.getenv("FORCE_RUN") == "1"
+
 # Team Leads (reporters)
 REPORTERS = [
     "Emmanuel Whyte",
@@ -24,11 +27,23 @@ REPORTERS = [
     "Zane Roberts",
 ]
 
-def compute_window_utc(now_utc: datetime):
+def require_env(name: str):
+    if not os.getenv(name):
+        raise RuntimeError(f"Missing required env var: {name}")
+
+def should_post_now(now_utc: datetime) -> bool:
     """
-    Window:
-      Start = Last Friday 12:00 PM America/Chicago
-      End   = This Friday 12:00 PM America/Chicago (end-exclusive)
+    Scheduled behavior: Only post if it's Friday 12pm in America/Chicago.
+    """
+    central = ZoneInfo("America/Chicago")
+    now_c = now_utc.astimezone(central)
+    return (now_c.weekday() == 4) and (now_c.hour == 12)
+
+def compute_window(now_utc: datetime):
+    """
+    Window anchored to Friday noon Central:
+      Start = last Friday 12:00 PM America/Chicago
+      End   = this Friday 12:00 PM America/Chicago (end-exclusive)
     """
     central = ZoneInfo("America/Chicago")
     now_central = now_utc.astimezone(central)
@@ -42,14 +57,13 @@ def compute_window_utc(now_utc: datetime):
     window_end_central = this_friday_noon
     window_start_central = window_end_central - timedelta(days=7)
 
-    return (
-        window_start_central.astimezone(timezone.utc),
-        window_end_central.astimezone(timezone.utc),
-        window_start_central,
-        window_end_central,
-    )
+    return window_start_central, window_end_central
+
+def to_utc(dt_local: datetime) -> datetime:
+    return dt_local.astimezone(timezone.utc)
 
 def jira_dt(dt_utc: datetime) -> str:
+    # Format for JQL date-time literal
     return dt_utc.strftime("%Y-%m-%d %H:%M")
 
 def build_jql(start_utc: datetime, end_utc: datetime) -> str:
@@ -95,24 +109,25 @@ def post_to_slack(text: str):
     resp = requests.post(SLACK_WEBHOOK, json={"text": text}, timeout=30)
     resp.raise_for_status()
 
-def should_post_now(now_utc: datetime) -> bool:
-    """
-    GitHub cron runs in UTC.
-    We schedule two UTC times and only post if it's exactly
-    Friday 12 PM America/Chicago.
-    """
-    central = ZoneInfo("America/Chicago")
-    now_c = now_utc.astimezone(central)
-    return (now_c.weekday() == 4) and (now_c.hour == 12)
-
 if __name__ == "__main__":
+    # Validate secrets are present
+    require_env("JIRA_EMAIL")
+    require_env("JIRA_API_TOKEN")
+    require_env("SLACK_WEBHOOK")
+
     now_utc = datetime.now(timezone.utc)
 
-    if not should_post_now(now_utc):
-        raise SystemExit("Not within Friday 12pm CT hour; skipping.")
+    # If not a manual run, enforce Friday 12pm CT
+    if (not FORCE_RUN) and (not should_post_now(now_utc)):
+        print("Not within Friday 12pm CT hour; skipping.")
+        raise SystemExit(0)
 
-    start_utc, end_utc, start_c, end_c = compute_window_utc(now_utc)
+    # Compute the anchored window and query Jira
+    start_c, end_c = compute_window(now_utc)
+    start_utc, end_utc = to_utc(start_c), to_utc(end_c)
+
     jql = build_jql(start_utc, end_utc)
     issues = get_issues(jql)
+
     msg = format_message(issues, start_c, end_c)
     post_to_slack(msg)
