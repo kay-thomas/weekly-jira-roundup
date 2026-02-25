@@ -7,12 +7,12 @@ from zoneinfo import ZoneInfo
 import requests
 
 JIRA_DOMAIN = "zillowgroup.atlassian.net"
-JIRA_API_BASE = f"https://{JIRA_DOMAIN}/rest/api/3"
 
 # ✅ TEST MODE: Kay Thomas only
 KAY_THOMAS_ACCOUNT_ID = "712020:e42cac78-cbc0-4090-985a-549ad893ef45"
 
-BASE_JQL = ""  # optional, leave blank for now
+# Optional extra filters you might add later (project = XYZ, etc.)
+BASE_JQL = ""  # leave blank for now
 
 CENTRAL_TZ = ZoneInfo("America/Chicago")
 
@@ -45,7 +45,7 @@ def get_config() -> Config:
     event_name = os.getenv("GITHUB_EVENT_NAME", "").strip()
     force_run_env = os.getenv("FORCE_RUN", "").strip()
 
-    # ✅ If you click "Run workflow" (workflow_dispatch), it will run no matter what time it is.
+    # ✅ If you click "Run workflow" (workflow_dispatch), it runs regardless of time.
     force_run = parse_bool(force_run_env) or (event_name == "workflow_dispatch")
 
     return Config(
@@ -80,59 +80,79 @@ def last_friday_noon_central(now_ct: datetime) -> datetime:
 def build_jql(start_ct: datetime, end_ct: datetime) -> str:
     """
     Jira JQL expects user references by accountId in Jira Cloud.
-    Times are passed in Central time with offset.
+    We pass timestamps in Central time with their respective offsets (DST-safe).
     """
-    start_str = start_ct.strftime("%Y-%m-%d %H:%M")
-    end_str = end_ct.strftime("%Y-%m-%d %H:%M")
-    tz_offset = end_ct.strftime("%z")  # e.g. -0600 / -0500
+    start_str = start_ct.strftime("%Y-%m-%d %H:%M %z")  # includes offset
+    end_str = end_ct.strftime("%Y-%m-%d %H:%M %z")      # includes offset
 
     parts = []
     if BASE_JQL.strip():
         parts.append(f"({BASE_JQL.strip()})")
 
     parts.append(f"reporter = {KAY_THOMAS_ACCOUNT_ID}")
-    parts.append(f'created >= "{start_str} {tz_offset}"')
-    parts.append(f'created < "{end_str} {tz_offset}"')
+    parts.append(f'created >= "{start_str}"')
+    parts.append(f'created < "{end_str}"')
 
     return " AND ".join(parts)
 
 
-def jira_auth_header(email: str, token: str) -> dict:
-    basic = f"{email}:{token}".encode("utf-8")
-    return {"Authorization": "Basic " + requests.utils.to_native_string(__import__("base64").b64encode(basic))}
-
-
 def get_issues(config: Config, jql: str) -> list[dict]:
-    url = f"{JIRA_API_BASE}/search"
+    """
+    ✅ Uses NEW Jira Cloud endpoint:
+    POST /rest/api/3/search/jql
+
+    Atlassian removed the old /rest/api/3/search endpoint (410).
+    """
+    url = f"https://{JIRA_DOMAIN}/rest/api/3/search/jql"
+
     headers = {
-        **jira_auth_header(config.jira_email, config.jira_api_token),
         "Accept": "application/json",
         "Content-Type": "application/json",
     }
 
     issues: list[dict] = []
-    start_at = 0
-    max_results = 50
+    next_token: str | None = None
 
     while True:
-        params = {
+        body: dict = {
             "jql": jql,
-            "startAt": start_at,
-            "maxResults": max_results,
-            "fields": "summary,issuetype,project,priority,status,created,reporter",
+            "maxResults": 100,
+            "fields": [
+                "summary",
+                "issuetype",
+                "project",
+                "priority",
+                "status",
+                "created",
+                "reporter",
+            ],
+            "fieldsByKeys": True,
         }
-        resp = requests.get(url, headers=headers, params=params, timeout=30)
+
+        if next_token:
+            body["nextPageToken"] = next_token
+
+        resp = requests.post(
+            url,
+            headers=headers,
+            auth=(config.jira_email, config.jira_api_token),
+            json=body,
+            timeout=30,
+        )
 
         if resp.status_code >= 400:
             raise RuntimeError(f"Jira API error {resp.status_code}: {resp.text}")
 
         data = resp.json()
+
         batch = data.get("issues", [])
         issues.extend(batch)
 
-        total = data.get("total", 0)
-        start_at += len(batch)
-        if start_at >= total or not batch:
+        # New pagination model for this endpoint
+        next_token = data.get("nextPageToken")
+        is_last = data.get("isLast", True)
+
+        if is_last or not next_token:
             break
 
     return issues
@@ -140,7 +160,8 @@ def get_issues(config: Config, jql: str) -> list[dict]:
 
 def format_issue_line(issue: dict) -> str:
     key = issue.get("key", "UNKNOWN")
-    fields = issue.get("fields", {})
+    fields = issue.get("fields", {}) or {}
+
     summary = (fields.get("summary") or "").strip()
     status = (fields.get("status") or {}).get("name", "")
     priority = (fields.get("priority") or {}).get("name", "")
@@ -165,8 +186,8 @@ def main() -> int:
     config = get_config()
     now_ct = central_now()
 
-    # ✅ Scheduled behavior: only post at Friday 12pm CT (your workflow already triggers at that time),
-    # but if something triggers outside that time, we don't want a hard fail—just skip.
+    # ✅ Scheduled behavior: only post during Friday 12pm CT hour
+    # Manual run (workflow_dispatch) overrides this.
     if not config.force_run:
         if not (now_ct.weekday() == 4 and now_ct.hour == 12):
             print("Not within Friday 12pm CT hour; skipping.")
@@ -181,7 +202,13 @@ def main() -> int:
 
     issues = get_issues(config, jql)
 
-    header = f"*Weekly Jira Roundup (Kay Thomas)*\nWindow: {start_ct.strftime('%a %b %d, %Y %I:%M %p CT')} → {end_ct.strftime('%a %b %d, %Y %I:%M %p CT')}\nTotal: {len(issues)}"
+    header = (
+        "*Weekly Jira Roundup (Kay Thomas)*\n"
+        f"Window: {start_ct.strftime('%a %b %d, %Y %I:%M %p CT')} → "
+        f"{end_ct.strftime('%a %b %d, %Y %I:%M %p CT')}\n"
+        f"Total: {len(issues)}"
+    )
+
     if not issues:
         post_to_slack(config.slack_webhook, header + "\n• No issues found.")
         return 0
@@ -189,7 +216,7 @@ def main() -> int:
     lines = [format_issue_line(i) for i in issues]
     body = "\n".join(lines)
 
-    # Slack message size guard (simple)
+    # Slack message size guard
     msg = header + "\n" + body
     if len(msg) > 35000:
         msg = header + "\n" + "\n".join(lines[:150]) + "\n• (truncated)"
