@@ -3,7 +3,7 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta, time
 from zoneinfo import ZoneInfo
-from typing import Optional, List, Dict, Tuple
+from urllib.parse import quote_plus
 
 import requests
 
@@ -12,20 +12,17 @@ JIRA_API_BASE = f"https://{JIRA_DOMAIN}/rest/api/3"
 
 CENTRAL_TZ = ZoneInfo("America/Chicago")
 
-# Optional: extra constraints (project = ABC, labels, etc.)
-BASE_JQL = ""  # leave blank for now
-
-
-# Team leads (test now; can hardcode all accountIds later)
-# NOTE: We will EXCLUDE Adam + Marissa as requested.
-TEAM_LEADS: List[Dict[str, Optional[str]]] = [
-    {"name": "Kay Thomas", "accountId": "712020:e42cac78-cbc0-4090-985a-549ad893ef45"},
-    {"name": "Maryuri Orellana", "accountId": None},
-    {"name": "Emmanuel Whyte", "accountId": None},
-    {"name": "Evan Sandora", "accountId": None},
-    {"name": "Kyler VanderValk", "accountId": None},
-    {"name": "Zane Roberts", "accountId": None},
+# ✅ Team Leads (exclude Adam + Marissa per your note)
+TEAM_LEAD_DISPLAY_NAMES = [
+    "Kay Thomas",
+    "Maryuri Orellana",
+    "Emmanuel Whyte",
+    "Evan Sandora",
+    "Kyler VanderValk",
+    "Zane Roberts",
 ]
+
+BASE_JQL = ""  # optional: e.g. 'project in (ABC, FCOM, FESC, DEEP) AND statusCategory != Done'
 
 
 @dataclass
@@ -56,7 +53,7 @@ def get_config() -> Config:
     event_name = os.getenv("GITHUB_EVENT_NAME", "").strip()
     force_run_env = os.getenv("FORCE_RUN", "").strip()
 
-    # Manual "Run workflow" or FORCE_RUN=true should run regardless of time.
+    # ✅ Manual runs (workflow_dispatch) always run.
     force_run = parse_bool(force_run_env) or (event_name == "workflow_dispatch")
 
     return Config(
@@ -74,7 +71,7 @@ def central_now() -> datetime:
 
 def last_friday_noon_central(now_ct: datetime) -> datetime:
     """Most recent Friday 12:00 PM CT at or before now_ct."""
-    # Python: Monday=0 ... Sunday=6; Friday=4
+    # Monday=0 ... Sunday=6; Friday=4
     days_since_friday = (now_ct.weekday() - 4) % 7
     candidate_date = (now_ct - timedelta(days=days_since_friday)).date()
     candidate_dt = datetime.combine(candidate_date, time(12, 0), tzinfo=CENTRAL_TZ)
@@ -86,135 +83,93 @@ def last_friday_noon_central(now_ct: datetime) -> datetime:
     return candidate_dt
 
 
-def jira_user_search(config: Config, query: str) -> List[dict]:
-    """
-    Search users by name/email fragment.
-    Jira Cloud endpoint: GET /rest/api/3/user/search?query=...
-    """
-    url = f"{JIRA_API_BASE}/user/search"
+def jira_get(config: Config, path: str, params: dict | None = None) -> dict | list:
+    url = f"{JIRA_API_BASE}{path}"
     resp = requests.get(
         url,
-        headers={"Accept": "application/json"},
+        params=params or {},
         auth=(config.jira_email, config.jira_api_token),
-        params={"query": query},
+        headers={"Accept": "application/json"},
         timeout=30,
     )
     if resp.status_code >= 400:
-        raise RuntimeError(f"Jira user search error {resp.status_code}: {resp.text}")
-    data = resp.json()
-    return data if isinstance(data, list) else []
+        raise RuntimeError(f"Jira API GET {path} error {resp.status_code}: {resp.text}")
+    return resp.json()
 
 
-def resolve_account_id(config: Config, display_name: str) -> Optional[str]:
+def resolve_account_ids(config: Config, display_names: list[str]) -> dict[str, str]:
     """
-    Resolve a Jira Cloud accountId for a display name.
-    We DO NOT use names in JQL — names are only used here for lookup.
-    Selection priority:
-      1) active + exact displayName match (case-insensitive)
-      2) active + contains match
-      3) first active
-      4) first result
+    Resolve Jira Cloud accountIds from display names using:
+      GET /rest/api/3/user/search?query=<name>&maxResults=50
+    We then select the exact displayName match (case-insensitive). If none,
+    we fall back to the first active result.
     """
-    results = jira_user_search(config, display_name)
-    if not results:
-        return None
+    resolved: dict[str, str] = {}
 
-    dn_lower = display_name.strip().lower()
+    for name in display_names:
+        results = jira_get(config, "/user/search", params={"query": name, "maxResults": 50})
+        if not isinstance(results, list) or not results:
+            raise RuntimeError(f'Could not resolve Jira accountId for "{name}" (no results).')
 
-    def is_active(u: dict) -> bool:
-        return bool(u.get("active", False))
-
-    def dn(u: dict) -> str:
-        return str(u.get("displayName", "")).strip()
-
-    # 1) active exact match
-    for u in results:
-        if is_active(u) and dn(u).lower() == dn_lower and u.get("accountId"):
-            return u["accountId"]
-
-    # 2) active contains match
-    for u in results:
-        if is_active(u) and dn_lower in dn(u).lower() and u.get("accountId"):
-            return u["accountId"]
-
-    # 3) first active
-    for u in results:
-        if is_active(u) and u.get("accountId"):
-            return u["accountId"]
-
-    # 4) first result
-    first = results[0]
-    return first.get("accountId")
-
-
-def get_team_lead_ids(config: Config) -> Tuple[List[str], List[str]]:
-    """
-    Returns (account_ids, warnings).
-    """
-    ids: List[str] = []
-    warnings: List[str] = []
-
-    for tl in TEAM_LEADS:
-        name = (tl.get("name") or "").strip()
-        aid = (tl.get("accountId") or "").strip()
-
-        if aid:
-            ids.append(aid)
+        # Prefer exact (case-insensitive) displayName match and active users
+        exact = [
+            u for u in results
+            if (u.get("displayName", "") or "").strip().lower() == name.strip().lower()
+            and u.get("active", True) is True
+        ]
+        if exact:
+            resolved[name] = exact[0]["accountId"]
             continue
 
-        resolved = resolve_account_id(config, name)
-        if not resolved:
-            warnings.append(f"Could not resolve accountId for: {name}")
-            continue
+        # Otherwise pick first active result
+        active = [u for u in results if u.get("active", True) is True]
+        pick = active[0] if active else results[0]
+        if "accountId" not in pick:
+            raise RuntimeError(f'Could not resolve Jira accountId for "{name}" (missing accountId).')
 
-        ids.append(resolved)
+        resolved[name] = pick["accountId"]
 
-    # Deduplicate while preserving order
-    seen = set()
-    deduped: List[str] = []
-    for x in ids:
-        if x not in seen:
-            deduped.append(x)
-            seen.add(x)
-
-    return deduped, warnings
+    return resolved
 
 
-def build_jql(account_ids: List[str], start_ct: datetime, end_ct: datetime) -> str:
+def build_jql(start_ct: datetime, end_ct: datetime, account_ids: list[str]) -> str:
     """
-    Jira JQL expects user references by accountId in Jira Cloud.
-    Times are passed in Central time with offset.
+    IMPORTANT: Jira JQL date parsing is most reliable WITHOUT an explicit timezone suffix.
+    Jira interprets the timestamps in the querying user's timezone/profile.
+    So we send: YYYY-MM-DD HH:mm (no -0600).
     """
-    if not account_ids:
-        raise RuntimeError("No Jira accountIds available for reporter filter.")
-
     start_str = start_ct.strftime("%Y-%m-%d %H:%M")
     end_str = end_ct.strftime("%Y-%m-%d %H:%M")
-    tz_offset = end_ct.strftime("%z")  # e.g. -0600 / -0500
 
     parts = []
     if BASE_JQL.strip():
         parts.append(f"({BASE_JQL.strip()})")
 
-    # reporter IN (<accountId>, <accountId>, ...)
-    reporter_clause = "reporter in (" + ", ".join(account_ids) + ")"
-    parts.append(reporter_clause)
+    # Reporter list (accountIds)
+    # Jira Cloud JQL supports: reporter in (<accountId>, <accountId>, ...)
+    reporters = ", ".join(account_ids)
+    parts.append(f"reporter in ({reporters})")
 
-    parts.append(f'created >= "{start_str} {tz_offset}"')
-    parts.append(f'created < "{end_str} {tz_offset}"')
+    parts.append(f'created >= "{start_str}"')
+    parts.append(f'created < "{end_str}"')
+
+    # Nice ordering for readability
+    parts.append("ORDER BY created DESC")
 
     return " AND ".join(parts)
 
 
-def get_issues(config: Config, jql: str) -> List[dict]:
+def get_issues(config: Config, jql: str) -> list[dict]:
     """
-    Jira Cloud NEW endpoint:
-    POST /rest/api/3/search/jql
+    Uses NEW Jira Cloud endpoint:
+      POST /rest/api/3/search/jql
+
+    Paginates via nextPageToken.
     """
     url = f"{JIRA_API_BASE}/search/jql"
 
-    issues: List[dict] = []
-    next_token: Optional[str] = None
+    issues: list[dict] = []
+    next_token = None
 
     while True:
         body = {
@@ -229,15 +184,14 @@ def get_issues(config: Config, jql: str) -> List[dict]:
                 "created",
                 "reporter",
             ],
-            "fieldsByKeys": True,
         }
         if next_token:
             body["nextPageToken"] = next_token
 
         resp = requests.post(
             url,
-            headers={"Accept": "application/json", "Content-Type": "application/json"},
             auth=(config.jira_email, config.jira_api_token),
+            headers={"Accept": "application/json", "Content-Type": "application/json"},
             json=body,
             timeout=30,
         )
@@ -264,10 +218,12 @@ def format_issue_line(issue: dict) -> str:
     summary = (fields.get("summary") or "").strip()
     status = (fields.get("status") or {}).get("name", "")
     priority = (fields.get("priority") or {}).get("name", "")
+    reporter = (fields.get("reporter") or {}).get("displayName", "")
+
     issue_url = f"https://{JIRA_DOMAIN}/browse/{key}"
 
     bits = [f"<{issue_url}|{key}>", summary]
-    meta = [x for x in [status, priority] if x]
+    meta = [x for x in [reporter, status, priority] if x]
     if meta:
         bits.append(f"({', '.join(meta)})")
 
@@ -280,13 +236,16 @@ def post_to_slack(webhook: str, text: str) -> None:
         raise RuntimeError(f"Slack webhook error {resp.status_code}: {resp.text}")
 
 
+def jira_search_link(jql: str) -> str:
+    # Works in browser for quick verification/debugging.
+    return f"https://{JIRA_DOMAIN}/issues/?jql={quote_plus(jql)}"
+
+
 def main() -> int:
     config = get_config()
     now_ct = central_now()
 
-    # Scheduled behavior:
-    # - If schedule triggers outside the intended hour, do not fail the job; just skip.
-    # Manual workflow_dispatch always runs.
+    # ✅ Scheduled behavior: only post at Friday 12pm CT unless forced.
     if not config.force_run:
         if not (now_ct.weekday() == 4 and now_ct.hour == 12):
             print("Not within Friday 12pm CT hour; skipping.")
@@ -295,45 +254,37 @@ def main() -> int:
     start_ct = last_friday_noon_central(now_ct)
     end_ct = now_ct
 
-    account_ids, warnings = get_team_lead_ids(config)
-    jql = build_jql(account_ids, start_ct, end_ct)
+    # ✅ Resolve accountIds dynamically (so you don't have to hardcode them)
+    name_to_id = resolve_account_ids(config, TEAM_LEAD_DISPLAY_NAMES)
+    account_ids = list(name_to_id.values())
+
+    jql = build_jql(start_ct, end_ct, account_ids)
 
     print(f"Window: {start_ct.isoformat()} → {end_ct.isoformat()}")
-    print(f"Resolved reporter accountIds ({len(account_ids)}): {account_ids}")
-    if warnings:
-        print("WARNINGS:")
-        for w in warnings:
-            print(f" - {w}")
+    print(f"Reporters tracked: {len(account_ids)}")
     print(f"JQL: {jql}")
+    print(f"Verify: {jira_search_link(jql)}")
 
     issues = get_issues(config, jql)
 
-    # Slack header
     header = (
         "*Weekly Jira Roundup (Team Leads)*\n"
         f"Window: {start_ct.strftime('%a %b %d, %Y %I:%M %p CT')} → {end_ct.strftime('%a %b %d, %Y %I:%M %p CT')}\n"
         f"Reporters tracked: {len(account_ids)}\n"
-        f"Total: {len(issues)}"
+        f"Total: {len(issues)}\n"
+        f"<{jira_search_link(jql)}|Open this JQL in Jira>"
     )
 
-    # Include warnings in Slack (helpful during test phase)
-    warn_block = ""
-    if warnings:
-        warn_lines = "\n".join([f"• {w}" for w in warnings])
-        warn_block = "\n*Lookup warnings:*\n" + warn_lines
-
     if not issues:
-        post_to_slack(config.slack_webhook, header + warn_block + "\n• No issues found.")
+        post_to_slack(config.slack_webhook, header + "\n• No issues found.")
         return 0
 
     lines = [format_issue_line(i) for i in issues]
-    body = "\n".join(lines)
-
-    msg = header + warn_block + "\n" + body
+    msg = header + "\n" + "\n".join(lines)
 
     # Slack message size guard (simple)
     if len(msg) > 35000:
-        msg = header + warn_block + "\n" + "\n".join(lines[:150]) + "\n• (truncated)"
+        msg = header + "\n" + "\n".join(lines[:150]) + "\n• (truncated)"
 
     post_to_slack(config.slack_webhook, msg)
     return 0
