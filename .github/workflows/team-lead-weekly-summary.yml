@@ -1,0 +1,31 @@
+name: Team Lead Weekly Jira Summary
+
+on:
+  schedule:
+    # Monday at 8:30 AM Central
+    # This runs at 14:30 UTC (8:30 AM CST during winter)
+    - cron: '30 14 * * 1'
+  workflow_dispatch:
+
+jobs:
+  weekly-summary:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run Weekly Roundup
+        run: python weekly_roundup.py
+        env:
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
