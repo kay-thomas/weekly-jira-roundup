@@ -1,16 +1,12 @@
 import os
 import sys
 from dataclasses import dataclass
-from datetime import datetime, timedelta, time
-from zoneinfo import ZoneInfo
 from urllib.parse import quote_plus
 
 import requests
 
 JIRA_DOMAIN = "zillowgroup.atlassian.net"
 JIRA_API_BASE = f"https://{JIRA_DOMAIN}/rest/api/3"
-
-CENTRAL_TZ = ZoneInfo("America/Chicago")
 
 # Team Leads (Adam + Marissa intentionally excluded)
 TEAM_LEAD_DISPLAY_NAMES = [
@@ -22,7 +18,10 @@ TEAM_LEAD_DISPLAY_NAMES = [
     "Zane Roberts",
 ]
 
-BASE_JQL = ""  # Optional additional filters
+# How many days back to include
+ROLLING_DAYS = 7
+
+BASE_JQL = ""
 
 
 @dataclass
@@ -62,21 +61,6 @@ def get_config() -> Config:
         event_name=event_name,
         force_run=force_run,
     )
-
-
-def central_now() -> datetime:
-    return datetime.now(tz=CENTRAL_TZ)
-
-
-def last_friday_noon_central(now_ct: datetime) -> datetime:
-    days_since_friday = (now_ct.weekday() - 4) % 7
-    candidate_date = (now_ct - timedelta(days=days_since_friday)).date()
-    candidate_dt = datetime.combine(candidate_date, time(12, 0), tzinfo=CENTRAL_TZ)
-
-    if now_ct.weekday() == 4 and now_ct < candidate_dt:
-        candidate_dt -= timedelta(days=7)
-
-    return candidate_dt
 
 
 def jira_get(config: Config, path: str, params: dict | None = None):
@@ -120,60 +104,41 @@ def resolve_account_ids(config: Config, display_names: list[str]) -> dict[str, s
     return resolved
 
 
-# ✅ FIXED VERSION (Jira-compliant)
-def build_jql(start_ct: datetime, end_ct: datetime, account_ids: list[str]) -> str:
+def build_jql(account_ids: list[str]) -> str:
     if not account_ids:
         raise RuntimeError("No Jira accountIds available.")
 
-    # Round end time UP to next minute to prevent edge exclusion
-    end_ct_rounded = end_ct.replace(second=0, microsecond=0) + timedelta(minutes=1)
-
-    start_str = start_ct.strftime("%Y-%m-%d %H:%M")
-    end_str = end_ct_rounded.strftime("%Y-%m-%d %H:%M")
+    reporters = ", ".join([f'"{rid}"' for rid in account_ids])
 
     parts = []
     if BASE_JQL.strip():
         parts.append(f"({BASE_JQL.strip()})")
 
-    # Quote accountIds (required due to colon in ID)
-    reporters = ", ".join([f'"{rid}"' for rid in account_ids])
-
     parts.append(f"reporter in ({reporters})")
-    parts.append(f'created >= "{start_str}"')
-    parts.append(f'created < "{end_str}"')
+    parts.append(f"created >= -{ROLLING_DAYS}d")
 
     return " AND ".join(parts) + " ORDER BY created DESC"
 
 
 def get_issues(config: Config, jql: str) -> list[dict]:
-    url = f"{JIRA_API_BASE}/search/jql"
+    url = f"{JIRA_API_BASE}/search"
 
     issues = []
-    next_token = None
+    start_at = 0
 
     while True:
-        body = {
+        params = {
             "jql": jql,
+            "startAt": start_at,
             "maxResults": 100,
-            "fields": [
-                "summary",
-                "issuetype",
-                "project",
-                "priority",
-                "status",
-                "created",
-                "reporter",
-            ],
+            "fields": "summary,issuetype,project,priority,status,created,reporter",
         }
 
-        if next_token:
-            body["nextPageToken"] = next_token
-
-        resp = requests.post(
+        resp = requests.get(
             url,
+            params=params,
             auth=(config.jira_email, config.jira_api_token),
-            headers={"Accept": "application/json", "Content-Type": "application/json"},
-            json=body,
+            headers={"Accept": "application/json"},
             timeout=30,
         )
 
@@ -181,12 +146,13 @@ def get_issues(config: Config, jql: str) -> list[dict]:
             raise RuntimeError(f"Jira API error {resp.status_code}: {resp.text}")
 
         data = resp.json()
+
         issues.extend(data.get("issues", []))
 
-        next_token = data.get("nextPageToken")
-        is_last = data.get("isLast", True)
+        total = data.get("total", 0)
+        start_at += data.get("maxResults", 0)
 
-        if is_last or not next_token:
+        if start_at >= total:
             break
 
     return issues
@@ -220,22 +186,12 @@ def post_to_slack(webhook: str, text: str):
 
 def main() -> int:
     config = get_config()
-    now_ct = central_now()
-
-    if not config.force_run:
-        if not (now_ct.weekday() == 4 and now_ct.hour == 12):
-            print("Not within Friday 12pm CT hour; skipping.")
-            return 0
-
-    start_ct = last_friday_noon_central(now_ct)
-    end_ct = now_ct
 
     name_to_id = resolve_account_ids(config, TEAM_LEAD_DISPLAY_NAMES)
     account_ids = list(name_to_id.values())
 
-    jql = build_jql(start_ct, end_ct, account_ids)
+    jql = build_jql(account_ids)
 
-    print(f"Window: {start_ct.isoformat()} → {end_ct.isoformat()}")
     print(f"Reporters tracked: {len(account_ids)}")
     print(f"JQL: {jql}")
     print(f"Verify: {jira_search_link(jql)}")
@@ -244,8 +200,7 @@ def main() -> int:
 
     header = (
         "*Weekly Jira Roundup (Team Leads)*\n"
-        f"Window: {start_ct.strftime('%a %b %d, %Y %I:%M %p CT')} → "
-        f"{end_ct.strftime('%a %b %d, %Y %I:%M %p CT')}\n"
+        f"Rolling window: last {ROLLING_DAYS} days\n"
         f"Reporters tracked: {len(account_ids)}\n"
         f"Total: {len(issues)}\n"
         f"<{jira_search_link(jql)}|Open this JQL in Jira>"
