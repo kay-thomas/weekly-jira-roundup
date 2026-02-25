@@ -7,36 +7,23 @@ from urllib.parse import quote_plus
 
 import requests
 
-# =========================
-# JIRA + SLACK CONFIG
-# =========================
-
-DEFAULT_JIRA_DOMAIN = "zillowgroup.atlassian.net"
-JIRA_DOMAIN = (os.getenv("JIRA_DOMAIN", DEFAULT_JIRA_DOMAIN).strip() or DEFAULT_JIRA_DOMAIN)
+JIRA_DOMAIN = "zillowgroup.atlassian.net"
 JIRA_API_BASE = f"https://{JIRA_DOMAIN}/rest/api/3"
-
-BASE_JQL = os.getenv("BASE_JQL", "").strip()  # optional extra filter, leave blank if not needed
 
 CENTRAL_TZ = ZoneInfo("America/Chicago")
 
-# =========================
-# TEAM LEADS (accountIds)
-# NOTE: These are the 6 IDs you already tested with successfully.
-# =========================
+# Team Leads (Adam + Marissa intentionally excluded)
+TEAM_LEAD_DISPLAY_NAMES = [
+    "Kay Thomas",
+    "Maryuri Orellana",
+    "Emmanuel Whyte",
+    "Evan Sandora",
+    "Kyler VanderValk",
+    "Zane Roberts",
+]
 
-TEAM_LEAD_REPORTERS = {
-    "Kay Thomas": "712020:e42cac78-cbc0-4090-985a-549ad893ef45",
-    "Maryuri Orellana": "712020:894cfdc5-4bcb-4380-acf2-e280c363d6dd",
-    "Emmanuel Whyte": "712020:a520d240-bce6-4293-8101-f8d36195930b",
-    "Evan Sandora": "712020:453a4414-1382-4054-b762-a6191d545e65",
-    "Kyler VanderValk": "712020:f78b4a9f-5620-414c-ba21-b2aebf49ce33",
-    "Zane Roberts": "712020:663a58b0-f773-4b95-b2e2-77b78495cdcf",
-}
+BASE_JQL = ""  # Optional additional filters
 
-
-# =========================
-# TYPES
-# =========================
 
 @dataclass
 class Config:
@@ -46,10 +33,6 @@ class Config:
     event_name: str
     force_run: bool
 
-
-# =========================
-# ENV HELPERS
-# =========================
 
 def require_env(name: str) -> str:
     v = os.getenv(name, "").strip()
@@ -70,7 +53,6 @@ def get_config() -> Config:
     event_name = os.getenv("GITHUB_EVENT_NAME", "").strip()
     force_run_env = os.getenv("FORCE_RUN", "").strip()
 
-    # If workflow_dispatch OR FORCE_RUN=true, run regardless of time
     force_run = parse_bool(force_run_env) or (event_name == "workflow_dispatch")
 
     return Config(
@@ -82,78 +64,88 @@ def get_config() -> Config:
     )
 
 
-# =========================
-# TIME WINDOW HELPERS
-# =========================
-
 def central_now() -> datetime:
     return datetime.now(tz=CENTRAL_TZ)
 
 
 def last_friday_noon_central(now_ct: datetime) -> datetime:
-    """Most recent Friday 12:00 PM CT at or before now_ct."""
-    # Monday=0 ... Sunday=6; Friday=4
     days_since_friday = (now_ct.weekday() - 4) % 7
     candidate_date = (now_ct - timedelta(days=days_since_friday)).date()
-    candidate_dt = datetime.combine(candidate_date, time(12, 0, 0), tzinfo=CENTRAL_TZ)
+    candidate_dt = datetime.combine(candidate_date, time(12, 0), tzinfo=CENTRAL_TZ)
 
-    # If it's Friday but before noon, go back a week
     if now_ct.weekday() == 4 and now_ct < candidate_dt:
         candidate_dt -= timedelta(days=7)
 
     return candidate_dt
 
 
-def format_jql_datetime(dt_ct: datetime) -> str:
-    """
-    Jira parses a timestamp string inside quotes.
-    We embed the explicit offset from the datetime itself (-0600 / -0500),
-    so it remains accurate regardless of individual Jira profile timezones.
-    """
-    return dt_ct.strftime("%Y-%m-%d %H:%M:%S %z")
+def jira_get(config: Config, path: str, params: dict | None = None):
+    url = f"{JIRA_API_BASE}{path}"
+    resp = requests.get(
+        url,
+        params=params or {},
+        auth=(config.jira_email, config.jira_api_token),
+        headers={"Accept": "application/json"},
+        timeout=30,
+    )
+    if resp.status_code >= 400:
+        raise RuntimeError(f"Jira API GET {path} error {resp.status_code}: {resp.text}")
+    return resp.json()
 
 
-# =========================
-# JQL BUILD
-# =========================
+def resolve_account_ids(config: Config, display_names: list[str]) -> dict[str, str]:
+    resolved = {}
 
-def build_jql(start_ct: datetime, end_ct: datetime) -> str:
-    reporter_ids = list(TEAM_LEAD_REPORTERS.values())
+    for name in display_names:
+        results = jira_get(config, "/user/search", params={"query": name, "maxResults": 50})
 
-    # Quote accountIds to avoid parser edge cases with ':' in some routes
-    reporters = ", ".join([f'"{rid}"' for rid in reporter_ids])
+        if not isinstance(results, list) or not results:
+            raise RuntimeError(f'Could not resolve Jira accountId for "{name}"')
 
-    start_str = format_jql_datetime(start_ct)
-    end_str = format_jql_datetime(end_ct)
+        exact = [
+            u for u in results
+            if (u.get("displayName", "") or "").strip().lower() == name.strip().lower()
+            and u.get("active", True)
+        ]
+
+        if exact:
+            resolved[name] = exact[0]["accountId"]
+            continue
+
+        active = [u for u in results if u.get("active", True)]
+        pick = active[0] if active else results[0]
+
+        resolved[name] = pick["accountId"]
+
+    return resolved
+
+
+def build_jql(start_ct: datetime, end_ct: datetime, account_ids: list[str]) -> str:
+    if not account_ids:
+        raise RuntimeError("No Jira accountIds available.")
+
+    # 🔥 FIX: include seconds and use <=
+    start_str = start_ct.strftime("%Y-%m-%d %H:%M:%S")
+    end_str = end_ct.strftime("%Y-%m-%d %H:%M:%S")
 
     parts = []
-    if BASE_JQL:
-        parts.append(f"({BASE_JQL})")
+    if BASE_JQL.strip():
+        parts.append(f"({BASE_JQL.strip()})")
 
+    reporters = ", ".join(account_ids)
     parts.append(f"reporter in ({reporters})")
     parts.append(f'created >= "{start_str}"')
-    parts.append(f'created <= "{end_str}"')
+    parts.append(f'created <= "{end_str}"')  # changed from < to <=
 
-    # ORDER BY must NOT be preceded by AND
-    return " AND ".join(parts) + " ORDER BY created DESC"
+    where_clause = " AND ".join(parts)
 
+    return where_clause + " ORDER BY created DESC"
 
-def jql_to_browse_url(jql: str) -> str:
-    return f"https://{JIRA_DOMAIN}/issues/?jql={quote_plus(jql)}"
-
-
-# =========================
-# JIRA SEARCH (NEW ENDPOINT)
-# =========================
 
 def get_issues(config: Config, jql: str) -> list[dict]:
-    """
-    Uses NEW Jira Cloud endpoint:
-    POST /rest/api/3/search/jql
-    """
     url = f"{JIRA_API_BASE}/search/jql"
 
-    issues: list[dict] = []
+    issues = []
     next_token = None
 
     while True:
@@ -170,16 +162,14 @@ def get_issues(config: Config, jql: str) -> list[dict]:
                 "reporter",
             ],
         }
+
         if next_token:
             body["nextPageToken"] = next_token
 
         resp = requests.post(
             url,
-            headers={
-                "Accept": "application/json",
-                "Content-Type": "application/json",
-            },
             auth=(config.jira_email, config.jira_api_token),
+            headers={"Accept": "application/json", "Content-Type": "application/json"},
             json=body,
             timeout=30,
         )
@@ -188,8 +178,7 @@ def get_issues(config: Config, jql: str) -> list[dict]:
             raise RuntimeError(f"Jira API error {resp.status_code}: {resp.text}")
 
         data = resp.json()
-        batch = data.get("issues", [])
-        issues.extend(batch)
+        issues.extend(data.get("issues", []))
 
         next_token = data.get("nextPageToken")
         is_last = data.get("isLast", True)
@@ -200,38 +189,36 @@ def get_issues(config: Config, jql: str) -> list[dict]:
     return issues
 
 
-# =========================
-# SLACK FORMATTING
-# =========================
-
 def format_issue_line(issue: dict) -> str:
     key = issue.get("key", "UNKNOWN")
     fields = issue.get("fields", {})
-
     summary = (fields.get("summary") or "").strip()
     status = (fields.get("status") or {}).get("name", "")
-    priority = (fields.get("priority") or {}).get("name", "Not Set")
-    reporter = (fields.get("reporter") or {}).get("displayName", "Unknown")
+    priority = (fields.get("priority") or {}).get("name", "")
+    reporter = (fields.get("reporter") or {}).get("displayName", "")
 
     issue_url = f"https://{JIRA_DOMAIN}/browse/{key}"
-    return f"• <{issue_url}|{key}> — {summary} ({reporter}, {status}, {priority})"
+
+    meta = [x for x in [reporter, status, priority] if x]
+    meta_str = f" ({', '.join(meta)})" if meta else ""
+
+    return f"• <{issue_url}|{key}> — {summary}{meta_str}"
 
 
-def post_to_slack(webhook: str, text: str) -> None:
+def jira_search_link(jql: str) -> str:
+    return f"https://{JIRA_DOMAIN}/issues/?jql={quote_plus(jql)}"
+
+
+def post_to_slack(webhook: str, text: str):
     resp = requests.post(webhook, json={"text": text}, timeout=30)
     if resp.status_code >= 400:
         raise RuntimeError(f"Slack webhook error {resp.status_code}: {resp.text}")
 
 
-# =========================
-# MAIN
-# =========================
-
 def main() -> int:
     config = get_config()
     now_ct = central_now()
 
-    # Scheduled behavior: only post at Friday 12pm CT unless forced
     if not config.force_run:
         if not (now_ct.weekday() == 4 and now_ct.hour == 12):
             print("Not within Friday 12pm CT hour; skipping.")
@@ -240,21 +227,25 @@ def main() -> int:
     start_ct = last_friday_noon_central(now_ct)
     end_ct = now_ct
 
-    jql = build_jql(start_ct, end_ct)
+    name_to_id = resolve_account_ids(config, TEAM_LEAD_DISPLAY_NAMES)
+    account_ids = list(name_to_id.values())
+
+    jql = build_jql(start_ct, end_ct, account_ids)
 
     print(f"Window: {start_ct.isoformat()} → {end_ct.isoformat()}")
-    print(f"Reporters tracked: {len(TEAM_LEAD_REPORTERS)}")
+    print(f"Reporters tracked: {len(account_ids)}")
     print(f"JQL: {jql}")
-    print(f"Verify: {jql_to_browse_url(jql)}")
+    print(f"Verify: {jira_search_link(jql)}")
 
     issues = get_issues(config, jql)
 
     header = (
         "*Weekly Jira Roundup (Team Leads)*\n"
-        f"Window: {start_ct.strftime('%a %b %d, %Y %I:%M %p CT')} → {end_ct.strftime('%a %b %d, %Y %I:%M %p CT')}\n"
-        f"Reporters tracked: {len(TEAM_LEAD_REPORTERS)}\n"
+        f"Window: {start_ct.strftime('%a %b %d, %Y %I:%M %p CT')} → "
+        f"{end_ct.strftime('%a %b %d, %Y %I:%M %p CT')}\n"
+        f"Reporters tracked: {len(account_ids)}\n"
         f"Total: {len(issues)}\n"
-        f"<{jql_to_browse_url(jql)}|Open this JQL in Jira>"
+        f"<{jira_search_link(jql)}|Open this JQL in Jira>"
     )
 
     if not issues:
@@ -264,7 +255,6 @@ def main() -> int:
     lines = [format_issue_line(i) for i in issues]
     msg = header + "\n" + "\n".join(lines)
 
-    # Slack message size guard
     if len(msg) > 35000:
         msg = header + "\n" + "\n".join(lines[:150]) + "\n• (truncated)"
 
