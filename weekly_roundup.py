@@ -12,17 +12,16 @@ import requests
 # =========================
 
 DEFAULT_JIRA_DOMAIN = "zillowgroup.atlassian.net"
-JIRA_DOMAIN = os.getenv("JIRA_DOMAIN", DEFAULT_JIRA_DOMAIN).strip() or DEFAULT_JIRA_DOMAIN
+JIRA_DOMAIN = (os.getenv("JIRA_DOMAIN", DEFAULT_JIRA_DOMAIN).strip() or DEFAULT_JIRA_DOMAIN)
 JIRA_API_BASE = f"https://{JIRA_DOMAIN}/rest/api/3"
 
-BASE_JQL = os.getenv("BASE_JQL", "").strip()  # optional
+BASE_JQL = os.getenv("BASE_JQL", "").strip()  # optional extra filter, leave blank if not needed
 
 CENTRAL_TZ = ZoneInfo("America/Chicago")
-UTC_TZ = ZoneInfo("UTC")
 
 # =========================
-# ✅ TEAM LEADS (accountIds)
-# (Using the 6 accountIds from your working run/logs)
+# TEAM LEADS (accountIds)
+# NOTE: These are the 6 IDs you already tested with successfully.
 # =========================
 
 TEAM_LEAD_REPORTERS = {
@@ -33,6 +32,7 @@ TEAM_LEAD_REPORTERS = {
     "Kyler VanderValk": "712020:f78b4a9f-5620-414c-ba21-b2aebf49ce33",
     "Zane Roberts": "712020:663a58b0-f773-4b95-b2e2-77b78495cdcf",
 }
+
 
 # =========================
 # TYPES
@@ -48,7 +48,7 @@ class Config:
 
 
 # =========================
-# ENV + TIME HELPERS
+# ENV HELPERS
 # =========================
 
 def require_env(name: str) -> str:
@@ -65,7 +65,7 @@ def parse_bool(v: str) -> bool:
 def get_config() -> Config:
     jira_email = require_env("JIRA_EMAIL")
     jira_api_token = require_env("JIRA_API_TOKEN")
-    slack_webhook = require_env("SLACK_WEBHOOK")  # <-- your existing secret name
+    slack_webhook = require_env("SLACK_WEBHOOK")
 
     event_name = os.getenv("GITHUB_EVENT_NAME", "").strip()
     force_run_env = os.getenv("FORCE_RUN", "").strip()
@@ -82,6 +82,10 @@ def get_config() -> Config:
     )
 
 
+# =========================
+# TIME WINDOW HELPERS
+# =========================
+
 def central_now() -> datetime:
     return datetime.now(tz=CENTRAL_TZ)
 
@@ -91,7 +95,7 @@ def last_friday_noon_central(now_ct: datetime) -> datetime:
     # Monday=0 ... Sunday=6; Friday=4
     days_since_friday = (now_ct.weekday() - 4) % 7
     candidate_date = (now_ct - timedelta(days=days_since_friday)).date()
-    candidate_dt = datetime.combine(candidate_date, time(12, 0), tzinfo=CENTRAL_TZ)
+    candidate_dt = datetime.combine(candidate_date, time(12, 0, 0), tzinfo=CENTRAL_TZ)
 
     # If it's Friday but before noon, go back a week
     if now_ct.weekday() == 4 and now_ct < candidate_dt:
@@ -100,29 +104,27 @@ def last_friday_noon_central(now_ct: datetime) -> datetime:
     return candidate_dt
 
 
-def to_utc_jql(dt_ct: datetime) -> str:
+def format_jql_datetime(dt_ct: datetime) -> str:
     """
-    Convert Central dt -> UTC and format with explicit offset so Jira can't misinterpret timezone.
-    Example: 2026-02-25 16:33 +0000
+    Jira parses a timestamp string inside quotes.
+    We embed the explicit offset from the datetime itself (-0600 / -0500),
+    so it remains accurate regardless of individual Jira profile timezones.
     """
-    dt_utc = dt_ct.astimezone(UTC_TZ)
-    return dt_utc.strftime("%Y-%m-%d %H:%M %z")  # includes +0000
+    return dt_ct.strftime("%Y-%m-%d %H:%M:%S %z")
 
 
 # =========================
-# JQL + JIRA SEARCH
+# JQL BUILD
 # =========================
 
 def build_jql(start_ct: datetime, end_ct: datetime) -> str:
-    """
-    Build JQL using accountId list and created window in UTC with explicit +0000 offset.
-    This prevents Jira profile timezone differences from excluding issues.
-    """
     reporter_ids = list(TEAM_LEAD_REPORTERS.values())
-    reporters = ", ".join(reporter_ids)
 
-    start_str = to_utc_jql(start_ct)
-    end_str = to_utc_jql(end_ct)
+    # Quote accountIds to avoid parser edge cases with ':' in some routes
+    reporters = ", ".join([f'"{rid}"' for rid in reporter_ids])
+
+    start_str = format_jql_datetime(start_ct)
+    end_str = format_jql_datetime(end_ct)
 
     parts = []
     if BASE_JQL:
@@ -130,17 +132,24 @@ def build_jql(start_ct: datetime, end_ct: datetime) -> str:
 
     parts.append(f"reporter in ({reporters})")
     parts.append(f'created >= "{start_str}"')
-    parts.append(f'created < "{end_str}"')
+    parts.append(f'created <= "{end_str}"')
 
-    # ORDER BY is part of the JQL string, not an AND clause
+    # ORDER BY must NOT be preceded by AND
     return " AND ".join(parts) + " ORDER BY created DESC"
 
 
+def jql_to_browse_url(jql: str) -> str:
+    return f"https://{JIRA_DOMAIN}/issues/?jql={quote_plus(jql)}"
+
+
+# =========================
+# JIRA SEARCH (NEW ENDPOINT)
+# =========================
+
 def get_issues(config: Config, jql: str) -> list[dict]:
     """
-    NEW Jira Cloud endpoint:
+    Uses NEW Jira Cloud endpoint:
     POST /rest/api/3/search/jql
-    Supports pagination via nextPageToken.
     """
     url = f"{JIRA_API_BASE}/search/jql"
 
@@ -160,7 +169,6 @@ def get_issues(config: Config, jql: str) -> list[dict]:
                 "created",
                 "reporter",
             ],
-            "fieldsByKeys": True,
         }
         if next_token:
             body["nextPageToken"] = next_token
@@ -206,13 +214,7 @@ def format_issue_line(issue: dict) -> str:
     reporter = (fields.get("reporter") or {}).get("displayName", "Unknown")
 
     issue_url = f"https://{JIRA_DOMAIN}/browse/{key}"
-
-    # • KEY — Summary (Reporter, Status, Priority)
     return f"• <{issue_url}|{key}> — {summary} ({reporter}, {status}, {priority})"
-
-
-def jql_to_browse_url(jql: str) -> str:
-    return f"https://{JIRA_DOMAIN}/issues/?jql={quote_plus(jql)}"
 
 
 def post_to_slack(webhook: str, text: str) -> None:
@@ -260,7 +262,6 @@ def main() -> int:
         return 0
 
     lines = [format_issue_line(i) for i in issues]
-
     msg = header + "\n" + "\n".join(lines)
 
     # Slack message size guard
