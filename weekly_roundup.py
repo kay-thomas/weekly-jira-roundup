@@ -1,181 +1,110 @@
 import os
-import sys
-from dataclasses import dataclass
+import requests
+import datetime
 from urllib.parse import quote_plus
 
-import requests
 
-JIRA_DOMAIN = "zillowgroup.atlassian.net"
-JIRA_API_BASE = f"https://{JIRA_DOMAIN}/rest/api/3"
+# =========================
+# CONFIG
+# =========================
 
-TEAM_LEAD_DISPLAY_NAMES = [
-    "Kay Thomas",
-    "Maryuri Orellana",
-    "Emmanuel Whyte",
-    "Evan Sandora",
-    "Kyler VanderValk",
-    "Zane Roberts",
+JIRA_BASE_URL = os.environ["JIRA_BASE_URL"].rstrip("/")
+JIRA_EMAIL = os.environ["JIRA_EMAIL"]
+JIRA_API_TOKEN = os.environ["JIRA_API_TOKEN"]
+SLACK_WEBHOOK = os.environ["SLACK_WEBHOOK"]
+
+# Permanent Jira Filter View (ALL Team Lead Jiras)
+ALL_ESCALATIONS_FILTER_URL = "https://zillowgroup.atlassian.net/issues?filter=77859"
+
+# Reporter account IDs
+REPORTERS = [
+    "712020:e42cac78-cbc0-4090-985a-549ad893ef45",
+    "712020:894cfdc5-4bcb-4380-acf2-e280c363d6dd",
+    "712020:a520d240-bce6-4293-8101-f8d36195930b",
+    "712020:453a4414-1382-4054-b762-a6191d545e65",
+    "712020:f78b4a9f-5620-414c-ba21-b2aebf49ce33",
+    "712020:663a58b0-f773-4b95-b2e2-77b78495cdcf",
 ]
 
-BASE_JQL = ""
-DISPLAY_LIMIT = 6
+
+# =========================
+# DATE WINDOW (Last Mon–Fri)
+# =========================
+
+def get_last_week_window():
+    today = datetime.date.today()
+    this_monday = today - datetime.timedelta(days=today.weekday())
+    last_monday = this_monday - datetime.timedelta(days=7)
+    last_friday = last_monday + datetime.timedelta(days=4)
+
+    start = f"{last_monday} 00:00"
+    end = f"{last_friday} 23:59"
+
+    return start, end
 
 
-@dataclass
-class Config:
-    jira_email: str
-    jira_api_token: str
-    slack_webhook: str
+# =========================
+# JQL BUILDER
+# =========================
 
+def build_jql():
+    start, end = get_last_week_window()
+    reporter_clause = ", ".join(f'"{r}"' for r in REPORTERS)
 
-def require_env(name: str) -> str:
-    v = os.getenv(name, "").strip()
-    if not v:
-        raise RuntimeError(f"Missing required env var: {name}")
-    return v
-
-
-def get_config() -> Config:
-    return Config(
-        jira_email=require_env("JIRA_EMAIL"),
-        jira_api_token=require_env("JIRA_API_TOKEN"),
-        slack_webhook=require_env("SLACK_WEBHOOK"),
+    jql = (
+        f"reporter in ({reporter_clause}) "
+        f'AND created >= "{start}" '
+        f'AND created <= "{end}" '
+        "ORDER BY created DESC"
     )
+    return jql
 
 
-def jira_get(config: Config, path: str, params: dict | None = None):
-    url = f"{JIRA_API_BASE}{path}"
-    resp = requests.get(
+# =========================
+# JIRA API CALL
+# =========================
+
+def get_issues(jql):
+    url = f"{JIRA_BASE_URL}/rest/api/3/search/jql"
+
+    headers = {
+        "Accept": "application/json"
+    }
+
+    response = requests.get(
         url,
-        params=params or {},
-        auth=(config.jira_email, config.jira_api_token),
-        headers={"Accept": "application/json"},
-        timeout=30,
+        headers=headers,
+        params={"jql": jql, "maxResults": 100},
+        auth=(JIRA_EMAIL, JIRA_API_TOKEN)
     )
-    if resp.status_code >= 400:
-        raise RuntimeError(f"Jira API GET {path} error {resp.status_code}: {resp.text}")
-    return resp.json()
+
+    if response.status_code != 200:
+        raise RuntimeError(f"Jira API error {response.status_code}: {response.text}")
+
+    return response.json().get("issues", [])
 
 
-def resolve_account_ids(config: Config, display_names: list[str]) -> list[str]:
-    account_ids = []
+# =========================
+# SLACK POST
+# =========================
 
-    for name in display_names:
-        results = jira_get(
-            config,
-            "/user/search",
-            params={"query": name, "maxResults": 50},
-        )
+def post_to_slack(message):
+    response = requests.post(
+        SLACK_WEBHOOK,
+        json={"text": message}
+    )
 
-        if not results:
-            raise RuntimeError(f'Could not resolve Jira accountId for "{name}"')
-
-        exact = [
-            u for u in results
-            if u.get("displayName", "").strip().lower() == name.lower()
-            and u.get("active", True)
-        ]
-
-        pick = exact[0] if exact else results[0]
-        account_ids.append(pick["accountId"])
-
-    return account_ids
+    if response.status_code != 200:
+        raise RuntimeError(f"Slack webhook error {response.status_code}: {response.text}")
 
 
-def build_jql(account_ids: list[str]) -> str:
-    reporters = ", ".join([f'"{rid}"' for rid in account_ids])
+# =========================
+# MAIN
+# =========================
 
-    parts = []
-    if BASE_JQL.strip():
-        parts.append(f"({BASE_JQL.strip()})")
-
-    parts.append(f"reporter in ({reporters})")
-    parts.append("created >= startOfWeek(-1w)")
-    parts.append("created < startOfWeek()")
-
-    return " AND ".join(parts) + " ORDER BY created DESC"
-
-
-def get_issues(config: Config, jql: str) -> list[dict]:
-    url = f"{JIRA_API_BASE}/search/jql"
-
-    issues = []
-    next_token = None
-
-    while True:
-        body = {
-            "jql": jql,
-            "maxResults": 100,
-            "fields": [
-                "summary",
-                "priority",
-                "status",
-                "created",
-                "reporter",
-            ],
-        }
-
-        if next_token:
-            body["nextPageToken"] = next_token
-
-        resp = requests.post(
-            url,
-            auth=(config.jira_email, config.jira_api_token),
-            headers={
-                "Accept": "application/json",
-                "Content-Type": "application/json",
-            },
-            json=body,
-            timeout=30,
-        )
-
-        if resp.status_code >= 400:
-            raise RuntimeError(f"Jira API error {resp.status_code}: {resp.text}")
-
-        data = resp.json()
-        issues.extend(data.get("issues", []))
-
-        next_token = data.get("nextPageToken")
-        if not next_token:
-            break
-
-    return issues
-
-
-def format_issue_line(issue: dict) -> str:
-    key = issue.get("key", "UNKNOWN")
-    fields = issue.get("fields", {})
-
-    summary = (fields.get("summary") or "").strip()
-    status = (fields.get("status") or {}).get("name", "")
-    priority = (fields.get("priority") or {}).get("name", "")
-    reporter = (fields.get("reporter") or {}).get("displayName", "")
-
-    issue_url = f"https://{JIRA_DOMAIN}/browse/{key}"
-
-    meta = [x for x in [reporter, status, priority] if x]
-    meta_str = f" *({', '.join(meta)})*" if meta else ""
-
-    return f"• <{issue_url}|{key}> — {summary}{meta_str}"
-
-
-def jira_search_link(jql: str) -> str:
-    return f"https://{JIRA_DOMAIN}/issues/?jql={quote_plus(jql)}"
-
-
-def post_to_slack(webhook: str, text: str):
-    resp = requests.post(webhook, json={"text": text}, timeout=30)
-    if resp.status_code >= 400:
-        raise RuntimeError(f"Slack webhook error {resp.status_code}: {resp.text}")
-
-
-def main() -> int:
-    config = get_config()
-
-    account_ids = resolve_account_ids(config, TEAM_LEAD_DISPLAY_NAMES)
-    jql = build_jql(account_ids)
-
-    issues = get_issues(config, jql)
+def main():
+    jql = build_jql()
+    issues = get_issues(jql)
 
     header = (
         "⚠️ Escalations Created Last Week\n\n"
@@ -184,32 +113,49 @@ def main() -> int:
         "Please do not add examples to Jira on your own. This is for information purposes only.\n\n"
         f"Total: {len(issues)}\n\n"
     )
+
     if not issues:
-        post_to_slack(config.slack_webhook, header + "• No issues found.")
-        return 0
+        post_to_slack(header + "• No issues found.")
+        return
 
-    lines = [format_issue_line(i) for i in issues]
+    max_display = 6
+    displayed_issues = issues[:max_display]
 
-    if len(issues) > DISPLAY_LIMIT:
-        visible = lines[:DISPLAY_LIMIT]
-        remaining = len(issues) - DISPLAY_LIMIT
+    body_lines = []
 
-        footer = (
-            f"\n\n… and {remaining} more. "
-            f"<{jira_search_link(jql)}|View all escalations in Jira>"
+    for issue in displayed_issues:
+        key = issue["key"]
+        summary = issue["fields"]["summary"]
+        reporter = issue["fields"]["reporter"]["displayName"]
+        status = issue["fields"]["status"]["name"]
+        priority = issue["fields"]["priority"]["name"] if issue["fields"]["priority"] else "Not Set"
+
+        jira_link = f"{JIRA_BASE_URL}/browse/{key}"
+
+        body_lines.append(
+            f"• <{jira_link}|{key}> — {summary} "
+            f"*({reporter}, {status}, {priority})*"
         )
 
-        msg = header + "\n".join(visible) + footer
-    else:
-        msg = header + "\n".join(lines)
+    body = "\n".join(body_lines)
 
-    post_to_slack(config.slack_webhook, msg)
-    return 0
+    remaining = len(issues) - max_display
+
+    footer = ""
+    if remaining > 0:
+        footer = (
+            f"\n\n… and {remaining} more. "
+            f"<{ALL_ESCALATIONS_FILTER_URL}|View all escalations in Jira>"
+        )
+    else:
+        footer = (
+            f"\n\n<{ALL_ESCALATIONS_FILTER_URL}|View all escalations in Jira>"
+        )
+
+    full_message = header + body + footer
+
+    post_to_slack(full_message)
 
 
 if __name__ == "__main__":
-    try:
-        raise SystemExit(main())
-    except Exception as e:
-        print(f"ERROR: {e}", file=sys.stderr)
-        raise
+    main()
