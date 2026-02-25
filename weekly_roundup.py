@@ -77,7 +77,6 @@ def resolve_account_ids(config: Config, display_names: list[str]) -> list[str]:
     return account_ids
 
 
-# ✅ WEEKLY MONDAY → SUNDAY WINDOW (Timezone-agnostic)
 def build_jql(account_ids: list[str]) -> str:
     reporters = ", ".join([f'"{rid}"' for rid in account_ids])
 
@@ -126,7 +125,6 @@ def get_issues(config: Config, jql: str) -> list[dict]:
             raise RuntimeError(f"Jira API error {resp.status_code}: {resp.text}")
 
         data = resp.json()
-
         issues.extend(data.get("issues", []))
 
         next_token = data.get("nextPageToken")
@@ -175,23 +173,23 @@ def main() -> int:
 
     issues = get_issues(config, jql)
 
- header = (
-    "⚠️ *Escalations Created Last Week*\n\n"
-    "📌 Take a minute to review known issues to be aware of this week.\n"
-    "If your issue resembles one below, reference it in your Tag Team escalation.\n\n"
-    f"Total: {len(issues)}\n"
-    f"<{jira_search_link(jql)}|Open this JQL in Jira>\n\n"
-)
+    header = (
+        "⚠️ *Escalations Created Last Week*\n\n"
+        "📌 Take a minute to review known issues to be aware of this week.\n"
+        "If your issue resembles one below, reference it in your Tag Team escalation.\n\n"
+        f"Total: {len(issues)}\n"
+        f"<{jira_search_link(jql)}|Open this JQL in Jira>\n\n"
+    )
 
     if not issues:
-        post_to_slack(config.slack_webhook, header + "\n• No issues found.")
+        post_to_slack(config.slack_webhook, header + "• No issues found.")
         return 0
 
     lines = [format_issue_line(i) for i in issues]
-    msg = header + "\n" + "\n".join(lines)
+    msg = header + "\n".join(lines)
 
     if len(msg) > 35000:
-        msg = header + "\n" + "\n".join(lines[:150]) + "\n• (truncated)"
+        msg = header + "\n".join(lines[:150]) + "\n• (truncated)"
 
     post_to_slack(config.slack_webhook, msg)
     return 0
