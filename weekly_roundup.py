@@ -2,7 +2,6 @@ import os
 import sys
 from dataclasses import dataclass
 from datetime import datetime
-from urllib.parse import quote_plus
 
 import requests
 
@@ -10,10 +9,8 @@ import requests
 JIRA_DOMAIN = "zillowgroup.atlassian.net"
 JIRA_API_BASE = f"https://{JIRA_DOMAIN}/rest/api/3"
 
-# This is the ALL-TIME filter you provided (points to your saved Jira filter view)
 ALL_TIME_FILTER_URL = "https://zillowgroup.atlassian.net/issues?filter=77859"
 
-# Team Leads (Adam + Marissa intentionally excluded)
 TEAM_LEAD_DISPLAY_NAMES = [
     "Kay Thomas",
     "Maryuri Orellana",
@@ -23,14 +20,11 @@ TEAM_LEAD_DISPLAY_NAMES = [
     "Zane Roberts",
 ]
 
-BASE_JQL = ""  # Optional additional filters (leave blank unless you want extra constraints)
-
-# Message behavior
-MAX_ITEMS_IN_SLACK = 6  # show only 6 issues, rest forced to Jira
-TIMEZONE_LABEL = "CT"   # label only (we use timezone-agnostic JQL functions for accuracy)
+BASE_JQL = ""
+MAX_ITEMS_IN_SLACK = 6
+TIMEZONE_LABEL = "CT"
 
 
-# ====== Data model ======
 @dataclass
 class Config:
     jira_email: str
@@ -40,7 +34,6 @@ class Config:
     force_run: bool
 
 
-# ====== Helpers ======
 def require_env(name: str) -> str:
     v = os.getenv(name, "").strip()
     if not v:
@@ -60,7 +53,6 @@ def get_config() -> Config:
     event_name = os.getenv("GITHUB_EVENT_NAME", "").strip()
     force_run_env = os.getenv("FORCE_RUN", "").strip()
 
-    # If workflow_dispatch or FORCE_RUN=true, run regardless of schedule
     force_run = parse_bool(force_run_env) or (event_name == "workflow_dispatch")
 
     return Config(
@@ -87,10 +79,6 @@ def jira_get(config: Config, path: str, params: dict | None = None):
 
 
 def resolve_account_ids(config: Config, display_names: list[str]) -> dict[str, str]:
-    """
-    Resolve Jira Cloud accountIds for each display name.
-    We prefer exact displayName match + active user.
-    """
     resolved: dict[str, str] = {}
 
     for name in display_names:
@@ -99,7 +87,6 @@ def resolve_account_ids(config: Config, display_names: list[str]) -> dict[str, s
         if not isinstance(results, list) or not results:
             raise RuntimeError(f'Could not resolve Jira accountId for "{name}"')
 
-        # Prefer exact match + active
         exact = [
             u for u in results
             if (u.get("displayName", "") or "").strip().lower() == name.strip().lower()
@@ -109,7 +96,6 @@ def resolve_account_ids(config: Config, display_names: list[str]) -> dict[str, s
             resolved[name] = exact[0]["accountId"]
             continue
 
-        # Fallback: first active result, else first result
         active = [u for u in results if u.get("active", True)]
         pick = active[0] if active else results[0]
         resolved[name] = pick["accountId"]
@@ -118,12 +104,6 @@ def resolve_account_ids(config: Config, display_names: list[str]) -> dict[str, s
 
 
 def build_jql(account_ids: list[str]) -> str:
-    """
-    Timezone-agnostic "last week" window using Jira JQL functions:
-      - startOfWeek(-1) = last Monday 00:00 (in Jira/server/user context)
-      - startOfWeek()   = this Monday 00:00
-    This avoids timezone drift / seconds formatting issues.
-    """
     if not account_ids:
         raise RuntimeError("No Jira accountIds available.")
 
@@ -133,8 +113,6 @@ def build_jql(account_ids: list[str]) -> str:
 
     reporters = ", ".join([f'"{aid}"' for aid in account_ids])
     parts.append(f"reporter in ({reporters})")
-
-    # Cover last week Monday -> this week Monday
     parts.append("created >= startOfWeek(-1)")
     parts.append("created < startOfWeek()")
 
@@ -143,9 +121,6 @@ def build_jql(account_ids: list[str]) -> str:
 
 
 def get_issues(config: Config, jql: str) -> list[dict]:
-    """
-    Jira Cloud search endpoint (new): POST /rest/api/3/search/jql
-    """
     url = f"{JIRA_API_BASE}/search/jql"
 
     issues: list[dict] = []
@@ -190,10 +165,6 @@ def get_issues(config: Config, jql: str) -> list[dict]:
 
 
 def format_issue_line(issue: dict) -> str:
-    """
-    Slack formatting:
-    • KEY — Summary (**Reporter, Status, Priority**)
-    """
     key = issue.get("key", "UNKNOWN")
     fields = issue.get("fields", {}) or {}
     summary = (fields.get("summary") or "").strip()
@@ -205,7 +176,9 @@ def format_issue_line(issue: dict) -> str:
     issue_url = f"https://{JIRA_DOMAIN}/browse/{key}"
 
     meta_parts = [p for p in [reporter, status, priority] if p]
-    meta = f" (**{', '.join(meta_parts)}**)" if meta_parts else ""
+
+    # Proper Slack bold formatting
+    meta = f" (*{', '.join(meta_parts)}*)" if meta_parts else ""
 
     return f"• <{issue_url}|{key}> — {summary}{meta}"
 
@@ -216,23 +189,8 @@ def post_to_slack(webhook: str, text: str):
         raise RuntimeError(f"Slack webhook error {resp.status_code}: {resp.text}")
 
 
-# ====== Main ======
 def main() -> int:
     config = get_config()
-
-    # Scheduled behavior:
-    # - In production, you'll schedule this via GitHub Actions cron (Mon 8:30am CT).
-    # - If it runs outside schedule and isn't forced, we skip without failing.
-    #
-    # NOTE: GitHub cron uses UTC. Do the conversion in the workflow file.
-    if not config.force_run:
-        # If you still want a "soft guard", keep it loose:
-        # Only allow runs on Monday (any hour) unless forced.
-        now = datetime.utcnow()
-        # Monday in UTC may not match CT perfectly; so keep this guard minimal.
-        # If you prefer, delete this guard entirely and rely purely on cron schedule.
-        # We'll just not block anything here to avoid surprises.
-        pass
 
     name_to_id = resolve_account_ids(config, TEAM_LEAD_DISPLAY_NAMES)
     account_ids = list(name_to_id.values())
@@ -253,7 +211,6 @@ def main() -> int:
         post_to_slack(config.slack_webhook, header + "• No issues found.\n" + footer)
         return 0
 
-    # Show first N items
     shown = issues[:MAX_ITEMS_IN_SLACK]
     lines = [format_issue_line(i) for i in shown]
     msg = header + "\n".join(lines)
@@ -262,7 +219,6 @@ def main() -> int:
     footer = f"\n\n… and {remaining} more. <{ALL_TIME_FILTER_URL}|View all escalations in Jira>"
     msg += footer
 
-    # Slack size guard
     if len(msg) > 35000:
         msg = msg[:34000] + "\n\n… (truncated)\n" + f"<{ALL_TIME_FILTER_URL}|View all escalations in Jira>"
 
