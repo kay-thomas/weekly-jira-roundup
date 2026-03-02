@@ -1,4 +1,4 @@
-name: Team Lead Weekly Jira Summary
+name: FUB Team Lead Weekly Jira Summary
 
 on:
   schedule:
