@@ -16,7 +16,6 @@ TEAM_LEAD_DISPLAY_NAMES = [
     "Maryuri Orellana",
     "Emmanuel Whyte",
     "Evan Sandora",
-    "Kyler VanderValk",
     "Zane Roberts",
 ]
 
