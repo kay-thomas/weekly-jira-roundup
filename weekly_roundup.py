@@ -23,6 +23,9 @@ BASE_JQL = ""
 MAX_ITEMS_IN_SLACK = 6
 TIMEZONE_LABEL = "CT"
 
+# Exclude internal/non-bug Jira projects from the weekly escalation roundup
+EXCLUDED_PROJECT_KEYS = {"FSTL"}
+
 
 @dataclass
 class Config:
@@ -115,6 +118,11 @@ def build_jql(account_ids: list[str]) -> str:
     parts.append("created >= startOfWeek(-1)")
     parts.append("created < startOfWeek()")
 
+    # Exclude FUB Support Team Leads project issues like FSTL-123
+    if EXCLUDED_PROJECT_KEYS:
+        excluded_projects = ", ".join([f'"{key}"' for key in sorted(EXCLUDED_PROJECT_KEYS)])
+        parts.append(f"project not in ({excluded_projects})")
+
     where_clause = " AND ".join(parts)
     return where_clause + " ORDER BY created DESC"
 
@@ -163,6 +171,12 @@ def get_issues(config: Config, jql: str) -> list[dict]:
     return issues
 
 
+def is_excluded_issue(issue: dict) -> bool:
+    key = (issue.get("key") or "").upper()
+    project_key = key.split("-", 1)[0] if "-" in key else key
+    return project_key in EXCLUDED_PROJECT_KEYS
+
+
 def format_issue_line(issue: dict) -> str:
     key = issue.get("key", "UNKNOWN")
     fields = issue.get("fields", {}) or {}
@@ -196,6 +210,9 @@ def main() -> int:
 
     jql = build_jql(account_ids)
     issues = get_issues(config, jql)
+
+    # Safety filter in case the JQL is changed later or Jira returns unexpected results
+    issues = [issue for issue in issues if not is_excluded_issue(issue)]
 
     header = (
         ":warning: *Escalations Created Last Week*\n\n"
